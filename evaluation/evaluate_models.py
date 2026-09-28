@@ -385,7 +385,7 @@ def play_games(
     num_games=None,
 ):
     """
-    Play NUM_GAMES games simultaneously.
+    Play num_games games simultaneously.
 
     Games are grouped by side-to-move so positions using the same
     neural network can be searched together.
@@ -401,7 +401,7 @@ def play_games(
     # ------------------------------------------------------
 
     if num_games is None:
-        num_games = num_games
+        num_games = NUM_GAMES
 
     # ------------------------------------------------------
     # Master state
@@ -417,7 +417,7 @@ def play_games(
     # ------------------------------------------------------
 
     active = torch.ones(
-        NUM_GAMES,
+        num_games,
         dtype=torch.bool,
         device=device
     )
@@ -757,12 +757,7 @@ def play_games(
                 )
 
                 _, next_states = search_batch(
-                    white_model
-                    if all(
-                        model_a_is_white[g]
-                        for g in subset_global.detach().cpu().tolist()
-                    )
-                    else white_model,
+                    white_model,
                     subset_states,
                     device,
                 )
@@ -885,12 +880,7 @@ def play_games(
                 )
 
                 _, next_states = search_batch(
-                    black_model
-                    if all(
-                        not model_a_is_white[g]
-                        for g in subset_global.detach().cpu().tolist()
-                    )
-                    else black_model,
+                    black_model,
                     subset_states,
                     device,
                 )
@@ -930,9 +920,7 @@ def play_games(
                 )
 
                 _, next_states = search_batch(
-                    white_model
-                    if False
-                    else black_model,
+                    black_model,
                     subset_states,
                     device,
                 )
