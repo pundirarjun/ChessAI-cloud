@@ -73,7 +73,7 @@ MODEL_A_CHECKPOINT = (
 
 
 MODEL_B_CHECKPOINT = (
-    "/kaggle/working/chess-zero/checkpoints/rl_iteration_49.pt"
+    "/kaggle/working/chess-zero/checkpoints/rl_iteration_48.pt"
 )
 
 
