@@ -38,11 +38,11 @@ from mcts.gpu_mcts import GPUMCTS
 # CONFIGURATION
 # ==========================================================
 
-NUM_GAMES = 2
+NUM_GAMES = 300
 
-NUM_SIMULATIONS = 10
+NUM_SIMULATIONS = 100
 
-MAX_MOVES = 20
+MAX_MOVES = 400
 
 # 0.0 = deterministic evaluation.
 EVALUATION_TEMPERATURE = 0.25
@@ -66,14 +66,14 @@ DEVICE = torch.device(
 # ==========================================================
 
 MODEL_A_CHECKPOINT = (
-    "/kaggle/input/datasets/arjunthakur9999/checkpoints/chess_checkpoints/rl_iteration_45.pt"
+    "/kaggle/working/chess-zero/checkpoints/rl_iteration_49.pt"
 )
 
 
 
 
 MODEL_B_CHECKPOINT = (
-    "/kaggle/working/chess-zero/checkpoints/rl_iteration_46.pt"
+    "/kaggle/working/chess-zero/checkpoints/rl_iteration_48.pt"
 )
 
 
