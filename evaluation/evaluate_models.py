@@ -66,14 +66,14 @@ DEVICE = torch.device(
 # ==========================================================
 
 MODEL_A_CHECKPOINT = (
-    "/kaggle/working/chess-zero/checkpoints/rl_iteration_49.pt"
+    "/kaggle/working/chess-zero/checkpoints/rl_iteration_50.pt"
 )
 
 
 
 
 MODEL_B_CHECKPOINT = (
-    "/kaggle/working/chess-zero/checkpoints/rl_iteration_48.pt"
+    "/kaggle/working/chess-zero/checkpoints/rl_iteration_49.pt"
 )
 
 
