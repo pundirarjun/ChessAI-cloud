@@ -52,7 +52,7 @@ from training.train_step import train_from_replay_buffer
 # Iteration / paths
 # ---------------------------------------------------------------------------
 
-RL_ITERATION = 49
+RL_ITERATION = 50
 
 PREVIOUS_ITERATION = RL_ITERATION - 1
 
