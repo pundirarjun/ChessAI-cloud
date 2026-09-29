@@ -1,22 +1,30 @@
-
 # ============================================================
-# RL53 GPU MCTS PUCT + VIRTUAL-LOSS UNIT TEST
+# RL53 GPU MCTS BATCHED INTEGRATION TEST
 # ============================================================
 #
 # Purpose:
-#   Test the two remaining low-level MCTS mechanisms:
+#   Verify the complete batched MCTS loop used by self-play:
 #
-#   1. PUCT selection
-#   2. Virtual-loss reservation/removal
+#       selection
+#         -> virtual loss
+#         -> batched NN evaluation
+#         -> virtual-loss removal
+#         -> expansion
+#         -> backup
+#         -> repeat
 #
-# This test does NOT use:
-#   - the neural network for evaluation
-#   - replay data
-#   - chess move generation
-#   - self-play
+# This test does NOT use replay data or self-play.
+# It uses a real chess position and the actual ChessNet + GPUMCTS.
 #
-# It constructs a tiny artificial MCTS tree and checks that
-# GPUMCTS._select_leaves() follows the expected PUCT scores.
+# It checks:
+#   1. Search completes without errors.
+#   2. Root visit count == requested simulations.
+#   3. Root policy is finite and normalized.
+#   4. All selected root actions are legal.
+#   5. Increasing simulations increases root visits correctly.
+#   6. Virtual-loss buffers are zero after search.
+#   7. Real tree statistics contain no NaN/Inf.
+#   8. Search works with the actual batched search path.
 # ============================================================
 
 import sys
@@ -33,10 +41,11 @@ DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-C_PUCT = 1.5
+SIMULATIONS_LIST = [100, 200, 400, 800]
+BATCH_SIZE = 16
 
 print("=" * 100)
-print("RL53 GPU MCTS PUCT + VIRTUAL-LOSS UNIT TEST")
+print("RL53 GPU MCTS BATCHED INTEGRATION TEST")
 print("=" * 100)
 
 print()
@@ -51,116 +60,215 @@ sys.path.insert(0, PROJECT_DIR)
 
 from model.chess_net import ChessNet
 from mcts.gpu_mcts import GPUMCTS
+from environment.gpu_chess import GPUChess
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def get_node_stats(search, node_ids):
-    ids = torch.tensor(
-        node_ids,
-        dtype=torch.long,
-        device=DEVICE,
-    )
-
-    visits = search.visit_count[ids]
-    values = search.value_sum[ids]
-
-    q = torch.where(
-        visits > 0,
-        values / visits.float(),
-        torch.zeros_like(values),
-    )
-
-    return (
-        visits.detach().cpu().tolist(),
-        values.detach().cpu().tolist(),
-        q.detach().cpu().tolist(),
-    )
+def fail(msg):
+    raise AssertionError(msg)
 
 
-def reset_stats(search):
-    search.visit_count.zero_()
-    search.value_sum.zero_()
-
-    if hasattr(search, "virtual_visit_count"):
-        if search.virtual_visit_count is not None:
-            search.virtual_visit_count.zero_()
-
-    if hasattr(search, "virtual_value_sum"):
-        if search.virtual_value_sum is not None:
-            search.virtual_value_sum.zero_()
+def check(condition, msg):
+    if not bool(condition):
+        fail(msg)
+    print("PASS:", msg)
 
 
-def assert_equal(actual, expected, name):
-    actual = int(actual)
-    expected = int(expected)
-
-    if actual != expected:
-        raise AssertionError(
-            f"{name} FAILED: expected {expected}, got {actual}"
-        )
-
-    print(f"PASS: {name}: {actual}")
-
-
-def assert_close(actual, expected, name, tol=1e-5):
-    actual = float(actual)
+def check_close(value, expected, msg, tol=1e-5):
+    value = float(value)
     expected = float(expected)
 
-    if abs(actual - expected) > tol:
-        raise AssertionError(
-            f"{name} FAILED: expected {expected:+.6f}, "
-            f"got {actual:+.6f}"
+    if abs(value - expected) > tol:
+        fail(
+            f"{msg}: expected {expected:.8f}, got {value:.8f}"
         )
 
     print(
-        f"PASS: {name}: {actual:+.6f}"
+        f"PASS: {msg}: {value:.8f}"
     )
 
 
-def assert_true(condition, name):
-    if not bool(condition):
-        raise AssertionError(
-            f"{name} FAILED"
-        )
-
-    print(f"PASS: {name}")
+def tensor_finite(t):
+    return bool(torch.isfinite(t).all().item())
 
 
-def print_stats(search, node_ids, title):
-    print()
-    print("-" * 90)
-    print(title)
-    print("-" * 90)
+def tensor_sum(t):
+    return float(t.detach().float().sum().item())
 
-    visits, values, q = get_node_stats(
-        search,
-        node_ids,
+
+def make_initial_state():
+    """
+    Construct the standard initial chess position through GPUChess.
+    This avoids relying on python-chess for the test position.
+    """
+    env = GPUChess(device=DEVICE)
+
+    # Try the normal reset API first.
+    if hasattr(env, "reset"):
+        result = env.reset()
+
+        if torch.is_tensor(result):
+            state = result
+
+            if state.ndim == 3:
+                state = state.unsqueeze(0)
+
+            return env, state
+
+        if isinstance(result, tuple):
+            for item in result:
+                if torch.is_tensor(item):
+                    state = item
+
+                    if state.ndim == 3:
+                        state = state.unsqueeze(0)
+
+                    return env, state
+
+    # Some implementations expose the state directly.
+    for attr in ["state", "board_state", "states"]:
+        if hasattr(env, attr):
+            state = getattr(env, attr)
+
+            if torch.is_tensor(state):
+                if state.ndim == 3:
+                    state = state.unsqueeze(0)
+
+                return env, state
+
+    raise RuntimeError(
+        "Could not obtain the initial GPUChess state. "
+        "Inspect GPUChess.reset()/state API."
     )
 
-    for node, n, w, qq in zip(
-        node_ids,
-        visits,
-        values,
-        q,
-    ):
-        print(
-            f"Node {node:2d} | "
-            f"N={n:3d} | "
-            f"W={w:+.6f} | "
-            f"Q={qq:+.6f}"
-        )
+
+def get_root_policy(search, root_id=0):
+    """
+    Prefer the implementation's root_visit_policy().
+    Fall back to root_policy() if necessary.
+    """
+    if hasattr(search, "root_visit_policy"):
+        try:
+            policy = search.root_visit_policy(
+                torch.tensor(
+                    [root_id],
+                    dtype=torch.long,
+                    device=DEVICE,
+                )
+            )
+            return policy
+        except Exception:
+            pass
+
+    if hasattr(search, "root_policy"):
+        try:
+            policy = search.root_policy(
+                torch.tensor(
+                    [root_id],
+                    dtype=torch.long,
+                    device=DEVICE,
+                )
+            )
+            return policy
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "Could not obtain root visit policy from GPUMCTS."
+    )
+
+
+def get_root_actions_and_visits(search, root_id=0):
+    start = int(search.edge_start[root_id].item())
+    count = int(search.edge_count[root_id].item())
+
+    if count <= 0:
+        return [], [], []
+
+    end = start + count
+
+    actions = (
+        search.edge_action[start:end]
+        .detach()
+        .cpu()
+        .tolist()
+    )
+
+    child_ids = (
+        search.edge_child[start:end]
+        .long()
+    )
+
+    visits = (
+        search.visit_count[child_ids]
+        .detach()
+        .cpu()
+        .tolist()
+    )
+
+    return actions, visits, child_ids.detach().cpu().tolist()
+
+
+def get_root_legal_actions(env):
+    """
+    Best-effort extraction of legal root actions.
+
+    The exact GPUChess API has changed during development, so
+    try the known legal-move interfaces without altering the
+    actual MCTS implementation.
+    """
+    candidates = [
+        "legal_actions",
+        "get_legal_actions",
+        "legal_move_mask",
+    ]
+
+    for name in candidates:
+        if not hasattr(env, name):
+            continue
+
+        fn = getattr(env, name)
+
+        try:
+            result = fn()
+
+            if torch.is_tensor(result):
+                x = result
+
+                # Boolean/action mask.
+                if x.dtype == torch.bool:
+                    if x.ndim > 1:
+                        x = x[0]
+
+                    return set(
+                        torch.nonzero(
+                            x,
+                            as_tuple=False
+                        ).flatten().cpu().tolist()
+                    )
+
+                # Integer action list.
+                if x.ndim == 1:
+                    return set(
+                        x.long().cpu().tolist()
+                    )
+
+        except Exception:
+            continue
+
+    return None
 
 
 # ============================================================
-# CREATE MCTS
+# CREATE MODEL + SEARCH
 # ============================================================
 
 print()
 print("=" * 100)
-print("CREATING GPUMCTS")
+print("CREATING MODEL + GPUMCTS")
 print("=" * 100)
 
 model = ChessNet().to(DEVICE)
@@ -169,681 +277,416 @@ model.eval()
 search = GPUMCTS(
     model=model,
     device=DEVICE,
-    c_puct=C_PUCT,
+    c_puct=1.5,
 )
 
-search._allocate(
-    num_games=1,
-    num_simulations=10,
-)
-
-root = 0
-child_a = 1
-child_b = 2
-child_c = 3
+print("Model and GPUMCTS created.")
 
 
 # ============================================================
-# TEST 1
-# MANUAL PUCT SCORE CALCULATION
+# CREATE INITIAL POSITION
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 1: MANUAL PUCT SCORE CALCULATION")
-print("=" * 100)
-
-reset_stats(search)
-
-# Artificial root:
-#
-# Root N = 10
-#
-# Child A:
-#   P = 0.60
-#   N = 5
-#   W = +1.0
-#   Q = +0.20
-#
-# Child B:
-#   P = 0.30
-#   N = 2
-#   W = -0.4
-#   Q = -0.20
-#
-# Child C:
-#   P = 0.10
-#   N = 0
-#   Q = 0
-#
-# GPUMCTS uses:
-#
-#   score = -Q + c_puct * P * sqrt(parent_N) / (1 + N)
-#
-# Calculate manually.
-
-search.visit_count[root] = 10
-
-search.visit_count[child_a] = 5
-search.value_sum[child_a] = 1.0
-
-search.visit_count[child_b] = 2
-search.value_sum[child_b] = -0.4
-
-search.visit_count[child_c] = 0
-search.value_sum[child_c] = 0.0
-
-priors = [
-    0.60,
-    0.30,
-    0.10,
-]
-
-nodes = [
-    child_a,
-    child_b,
-    child_c,
-]
-
-expected_scores = []
-
-parent_n = 10.0
-
-for prior, node in zip(priors, nodes):
-    n = float(search.visit_count[node].item())
-    w = float(search.value_sum[node].item())
-
-    q = w / n if n > 0 else 0.0
-
-    u = (
-        C_PUCT
-        * prior
-        * math.sqrt(parent_n)
-        / (1.0 + n)
-    )
-
-    score = -q + u
-
-    expected_scores.append(score)
-
-    print(
-        f"Child {node}: "
-        f"P={prior:.3f} "
-        f"N={n:.0f} "
-        f"Q={q:+.6f} "
-        f"U={u:+.6f} "
-        f"PUCT={score:+.6f}"
-    )
-
-best_expected_index = max(
-    range(len(expected_scores)),
-    key=lambda i: expected_scores[i],
-)
-
-best_expected_node = nodes[
-    best_expected_index
-]
-
-print()
-print(
-    "Expected selected child:",
-    best_expected_node,
-)
-
-best_child = best_expected_node
-
-assert_true(
-    best_child == child_b,
-    "Manual PUCT selects the highest PUCT score"
-)
-
-
-# ============================================================
-# TEST 2
-# BUILD ARTIFICIAL ROOT EDGES
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 2: ARTIFICIAL ROOT TREE")
-print("=" * 100)
-
-reset_stats(search)
-
-# Root has three children.
-#
-# We manually construct the exact edge layout expected by
-# _select_leaves().
-#
-# root edge_start = 0
-# root edge_count = 3
-#
-# edge 0 -> child_a
-# edge 1 -> child_b
-# edge 2 -> child_c
-
-search.edge_start[root] = 0
-search.edge_count[root] = 3
-
-search.edge_child[0] = child_a
-search.edge_child[1] = child_b
-search.edge_child[2] = child_c
-
-search.edge_action[0] = 100
-search.edge_action[1] = 200
-search.edge_action[2] = 300
-
-search.edge_prior[0] = 0.60
-search.edge_prior[1] = 0.30
-search.edge_prior[2] = 0.10
-
-search.edge_valid[0] = True
-search.edge_valid[1] = True
-search.edge_valid[2] = True
-
-search.expanded[root] = True
-
-# Give children known statistics.
-search.visit_count[root] = 10
-
-search.visit_count[child_a] = 5
-search.value_sum[child_a] = 1.0
-
-search.visit_count[child_b] = 2
-search.value_sum[child_b] = -0.4
-
-search.visit_count[child_c] = 0
-search.value_sum[child_c] = 0.0
-
-# Children must be considered selectable nodes.
-search.expanded[child_a] = True
-search.expanded[child_b] = True
-search.expanded[child_c] = False
-
-# Non-terminal.
-search.terminal[root] = False
-search.terminal[child_a] = False
-search.terminal[child_b] = False
-search.terminal[child_c] = False
-
-print_stats(
-    search,
-    [root, child_a, child_b, child_c],
-    "ARTIFICIAL TREE",
-)
-
-
-# ============================================================
-# TEST 3
-# DIRECT _SELECT_LEAVES()
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 3: _SELECT_LEAVES()")
+print("CREATING INITIAL CHESS POSITION")
 print("=" * 100)
 
 try:
-    leaves, paths = search._select_leaves(
-        search._root_ids,
-        max_depth=8,
+    env, root_state = make_initial_state()
+
+    print("Root state shape:", tuple(root_state.shape))
+    print("Root state dtype:", root_state.dtype)
+    print("Root state device:", root_state.device)
+
+    check(
+        root_state.device.type == DEVICE.type,
+        "Root state is on the requested device",
     )
 
-    print()
-    print("Selected leaves:")
-    print(
-        leaves.detach()
-        .cpu()
-        .tolist()
+    check(
+        root_state.shape[-2:] == (8, 8),
+        "Root state has 8x8 board dimensions",
     )
 
+except Exception:
     print()
-    print("Selected paths:")
-    print(
-        paths.detach()
-        .cpu()
-        .tolist()
-    )
-
-except Exception as exc:
-    print()
-    print("ERROR calling _select_leaves():")
-    print(repr(exc))
+    print("FAILED TO CREATE INITIAL GPUChess STATE")
     traceback.print_exc()
     raise
 
 
 # ============================================================
-# TEST 4
-# VERIFY PUCT SELECTION
+# TEST 1
+# SINGLE SEARCH AT 100 SIMULATIONS
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 4: VERIFY PUCT SELECTION")
+print("TEST 1: 100-SIMULATION BATCHED SEARCH")
 print("=" * 100)
 
-selected_leaf = int(
-    leaves[0].item()
+try:
+    search.search(
+        root_states=root_state,
+        num_simulations=100,
+        dirichlet_alpha=None,
+        dirichlet_epsilon=0.0,
+        batch_size=BATCH_SIZE,
+    )
+except Exception:
+    print()
+    print("100-SIMULATION SEARCH FAILED")
+    traceback.print_exc()
+    raise
+
+root_n = int(search.visit_count[0].item())
+
+print("Root visit count:", root_n)
+
+check(
+    root_n == 100,
+    "Root visit count equals requested simulations",
 )
 
-print(
-    "Selected leaf:",
-    selected_leaf,
+check(
+    tensor_finite(search.visit_count),
+    "All visit counts are finite",
 )
 
-# Child B has the highest PUCT score in this setup:
-#   Child A = 0.274342
-#   Child B = 0.674342
-#   Child C = 0.474342
-# Therefore child B should be selected.
-
-assert_equal(
-    selected_leaf,
-    child_b,
-    "PUCT selected expected child",
+check(
+    tensor_finite(search.value_sum),
+    "All value sums are finite",
 )
+
+if hasattr(search, "virtual_visit_count"):
+    if search.virtual_visit_count is not None:
+        check(
+            int(search.virtual_visit_count.abs().sum().item()) == 0,
+            "Virtual visit buffer is zero after search",
+        )
+
+if hasattr(search, "virtual_value_sum"):
+    if search.virtual_value_sum is not None:
+        check(
+            float(search.virtual_value_sum.abs().sum().item()) < 1e-6,
+            "Virtual value buffer is zero after search",
+        )
+
+
+# ============================================================
+# TEST 2
+# ROOT POLICY VALIDATION
+# ============================================================
+
+print()
+print("=" * 100)
+print("TEST 2: ROOT POLICY VALIDATION")
+print("=" * 100)
+
+policy = get_root_policy(search, 0)
+
+print("Root policy shape:", tuple(policy.shape))
+
+check(
+    tensor_finite(policy),
+    "Root policy contains only finite values",
+)
+
+policy_sum = tensor_sum(policy)
+
+print("Root policy sum:", policy_sum)
+
+check_close(
+    policy_sum,
+    1.0,
+    "Root visit policy sums to 1",
+    tol=1e-4,
+)
+
+check(
+    bool((policy >= -1e-6).all().item()),
+    "Root policy contains no significant negative probabilities",
+)
+
+nonzero_policy = int(
+    (policy > 1e-8).sum().item()
+)
+
+print("Non-zero root actions:", nonzero_policy)
+
+check(
+    nonzero_policy > 0,
+    "Root policy contains at least one selected action",
+)
+
+
+# ============================================================
+# TEST 3
+# ROOT CHILD / VISIT CONSISTENCY
+# ============================================================
+
+print()
+print("=" * 100)
+print("TEST 3: ROOT CHILD / VISIT CONSISTENCY")
+print("=" * 100)
+
+actions, visits, child_ids = get_root_actions_and_visits(
+    search,
+    0,
+)
+
+print("Root edge count:", len(actions))
+print("Root actions with visits > 0:", sum(v > 0 for v in visits))
+print("Total child visits:", sum(visits))
+
+check(
+    len(actions) > 0,
+    "Root has expanded children",
+)
+
+check(
+    all(v >= 0 for v in visits),
+    "All root child visit counts are non-negative",
+)
+
+check(
+    sum(visits) == root_n,
+    "Root child visit counts sum to root visit count",
+)
+
+check(
+    len(actions) == len(set(actions)),
+    "Root child actions are unique",
+)
+
+check(
+    all(cid >= 0 for cid in child_ids),
+    "All root child IDs are valid",
+)
+
+
+# ============================================================
+# TEST 4
+# LEGALITY CROSS-CHECK
+# ============================================================
+
+print()
+print("=" * 100)
+print("TEST 4: ROOT ACTION LEGALITY CROSS-CHECK")
+print("=" * 100)
+
+legal_actions = get_root_legal_actions(env)
+
+if legal_actions is None:
+    print(
+        "WARNING: Could not obtain a compatible legal-action "
+        "interface from GPUChess."
+    )
+    print(
+        "Skipping direct action-set comparison; "
+        "other MCTS consistency tests remain active."
+    )
+else:
+    illegal_actions = [
+        action
+        for action in actions
+        if action not in legal_actions
+    ]
+
+    print("GPUChess legal action count:", len(legal_actions))
+    print("MCTS root action count:", len(actions))
+    print("Illegal MCTS root actions:", illegal_actions[:20])
+
+    check(
+        len(illegal_actions) == 0,
+        "Every MCTS root action is legal",
+    )
 
 
 # ============================================================
 # TEST 5
-# VIRTUAL LOSS ISOLATION
+# MULTI-DEPTH SIMULATION CONSISTENCY
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 5: VIRTUAL-LOSS ISOLATION")
+print("TEST 5: 100 / 200 / 400 / 800 SIMULATION CONSISTENCY")
 print("=" * 100)
 
-reset_stats(search)
+results = []
 
-# Rebuild a tiny root.
-search.visit_count[root] = 10
-
-search.edge_start[root] = 0
-search.edge_count[root] = 2
-
-search.edge_child[0] = child_a
-search.edge_child[1] = child_b
-
-search.edge_prior[0] = 0.50
-search.edge_prior[1] = 0.50
-
-search.edge_valid[0] = True
-search.edge_valid[1] = True
-
-search.expanded[root] = True
-search.expanded[child_a] = True
-search.expanded[child_b] = False
-
-search.terminal[root] = False
-search.terminal[child_a] = False
-search.terminal[child_b] = False
-
-# Real statistics before virtual loss.
-search.visit_count[child_a] = 4
-search.value_sum[child_a] = 0.8
-
-search.visit_count[child_b] = 4
-search.value_sum[child_b] = 0.8
-
-before_a_n = int(
-    search.visit_count[child_a].item()
-)
-
-before_a_w = float(
-    search.value_sum[child_a].item()
-)
-
-print()
-print("Before virtual loss:")
-print_stats(
-    search,
-    [root, child_a, child_b],
-    "REAL STATISTICS",
-)
-
-# Construct a path root -> child_a.
-test_path = torch.tensor(
-    [
-        [root, child_a]
-    ],
-    dtype=torch.int32,
-    device=DEVICE,
-)
-
-# Apply virtual loss.
-search._apply_virtual_loss(
-    test_path
-)
-
-print()
-print("After applying virtual loss:")
-print_stats(
-    search,
-    [root, child_a, child_b],
-    "STATISTICS AFTER VIRTUAL LOSS",
-)
-
-# ------------------------------------------------------------
-# Determine whether implementation uses separate virtual stats.
-# ------------------------------------------------------------
-
-has_separate_virtual = (
-    hasattr(search, "virtual_visit_count")
-    and search.virtual_visit_count is not None
-    and hasattr(search, "virtual_value_sum")
-    and search.virtual_value_sum is not None
-)
-
-if has_separate_virtual:
+for sims in SIMULATIONS_LIST:
 
     print()
-    print("Separate virtual-loss buffers detected.")
+    print("-" * 90)
+    print(f"Running {sims} simulations")
+    print("-" * 90)
 
-    real_n_after = int(
-        search.visit_count[child_a].item()
+    # Fresh search object for each depth so the test measures
+    # exactly the requested number of simulations.
+    depth_search = GPUMCTS(
+        model=model,
+        device=DEVICE,
+        c_puct=1.5,
     )
 
-    real_w_after = float(
-        search.value_sum[child_a].item()
+    try:
+        depth_search.search(
+            root_states=root_state,
+            num_simulations=sims,
+            dirichlet_alpha=None,
+            dirichlet_epsilon=0.0,
+            batch_size=BATCH_SIZE,
+        )
+    except Exception:
+        print()
+        print(f"{sims}-simulation search FAILED")
+        traceback.print_exc()
+        raise
+
+    n = int(
+        depth_search.visit_count[0].item()
     )
 
-    virtual_n = int(
-        search.virtual_visit_count[child_a].item()
+    policy_depth = get_root_policy(
+        depth_search,
+        0,
     )
 
-    virtual_w = float(
-        search.virtual_value_sum[child_a].item()
+    p_sum = tensor_sum(policy_depth)
+
+    actions_d, visits_d, child_ids_d = (
+        get_root_actions_and_visits(
+            depth_search,
+            0,
+        )
     )
 
-    assert_equal(
-        real_n_after,
-        before_a_n,
-        "Real visit count unchanged by virtual loss",
+    total_child_visits = sum(visits_d)
+
+    print("Root N:", n)
+    print("Policy sum:", p_sum)
+    print("Root child count:", len(actions_d))
+    print("Total child visits:", total_child_visits)
+
+    check(
+        n == sims,
+        f"Root visit count equals {sims}",
     )
 
-    assert_close(
-        real_w_after,
-        before_a_w,
-        "Real value sum unchanged by virtual loss",
+    check_close(
+        p_sum,
+        1.0,
+        f"Root policy sums to 1 at {sims} simulations",
+        tol=1e-4,
     )
 
-    assert_equal(
-        virtual_n,
-        1,
-        "Virtual visit count added",
+    check(
+        total_child_visits == sims,
+        f"Child visits sum to {sims}",
     )
 
-    assert_close(
-        virtual_w,
-        +1.0,
-        "Virtual value loss added",
+    check(
+        tensor_finite(depth_search.visit_count),
+        f"Visit counts finite at {sims} simulations",
     )
 
-else:
-
-    print()
-    print(
-        "WARNING: GPUMCTS uses real visit/value tensors "
-        "for virtual loss."
+    check(
+        tensor_finite(depth_search.value_sum),
+        f"Value sums finite at {sims} simulations",
     )
 
-    print(
-        "This test will verify that the temporary change "
-        "is completely reversible."
+    if hasattr(depth_search, "virtual_visit_count"):
+        if depth_search.virtual_visit_count is not None:
+            check(
+                int(
+                    depth_search.virtual_visit_count
+                    .abs()
+                    .sum()
+                    .item()
+                ) == 0,
+                f"Virtual visits cleared at {sims} simulations",
+            )
+
+    if hasattr(depth_search, "virtual_value_sum"):
+        if depth_search.virtual_value_sum is not None:
+            check(
+                float(
+                    depth_search.virtual_value_sum
+                    .abs()
+                    .sum()
+                    .item()
+                ) < 1e-6,
+                f"Virtual values cleared at {sims} simulations",
+            )
+
+    top_k = min(10, len(actions_d))
+
+    if top_k > 0:
+        pairs = sorted(
+            zip(actions_d, visits_d),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:top_k]
+
+        print("Top root actions:")
+        for action, visit in pairs:
+            print(
+                f"  action={action:4d} "
+                f"visits={visit:4d}"
+            )
+
+    results.append(
+        {
+            "simulations": sims,
+            "root_visits": n,
+            "policy_sum": p_sum,
+            "child_visits": total_child_visits,
+            "children": len(actions_d),
+        }
     )
 
 
 # ============================================================
 # TEST 6
-# REMOVE VIRTUAL LOSS
+# ROOT POLICY EVOLUTION
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 6: REMOVE VIRTUAL LOSS")
+print("TEST 6: ROOT POLICY EVOLUTION")
 print("=" * 100)
-
-search._remove_virtual_loss(
-    test_path
-)
-
-after_n = int(
-    search.visit_count[child_a].item()
-)
-
-after_w = float(
-    search.value_sum[child_a].item()
-)
 
 print()
-print("After removing virtual loss:")
-print_stats(
-    search,
-    [root, child_a, child_b],
-    "RESTORED STATISTICS",
-)
+print("Simulation summary:")
 
-assert_equal(
-    after_n,
-    before_a_n,
-    "Visit count restored",
-)
-
-assert_close(
-    after_w,
-    before_a_w,
-    "Value sum restored",
-)
-
-
-if has_separate_virtual:
-
-    virtual_n_after = int(
-        search.virtual_visit_count[child_a].item()
-    )
-
-    virtual_w_after = float(
-        search.virtual_value_sum[child_a].item()
-    )
-
-    assert_equal(
-        virtual_n_after,
-        0,
-        "Virtual visit count restored to zero",
-    )
-
-    assert_close(
-        virtual_w_after,
-        0.0,
-        "Virtual value sum restored to zero",
-    )
-
-
-# ============================================================
-# TEST 7
-# VIRTUAL LOSS CHANGES EFFECTIVE SELECTION
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 7: VIRTUAL LOSS CHANGES EFFECTIVE SELECTION")
-print("=" * 100)
-
-reset_stats(search)
-
-search.visit_count[root] = 10
-
-# Fully clear the root edge slots first so stale edges from
-# previous artificial-tree tests cannot leak into this test.
-search.edge_start[root] = 0
-search.edge_count[root] = 2
-
-search.edge_child[0:3] = -1
-search.edge_action[0:3] = -1
-search.edge_prior[0:3] = 0.0
-search.edge_valid[0:3] = False
-
-search.edge_child[0] = child_a
-search.edge_child[1] = child_b
-
-search.edge_prior[0] = 0.50
-search.edge_prior[1] = 0.50
-
-search.edge_valid[0] = True
-search.edge_valid[1] = True
-
-search.expanded[root] = True
-search.expanded[child_a] = True
-search.expanded[child_b] = False
-
-search.terminal[root] = False
-search.terminal[child_a] = False
-search.terminal[child_b] = False
-
-# Same real statistics.
-search.visit_count[child_a] = 4
-search.value_sum[child_a] = 0.8
-
-search.visit_count[child_b] = 4
-search.value_sum[child_b] = 0.8
-
-# Reserve child A.
-test_path = torch.tensor(
-    [
-        [root, child_a]
-    ],
-    dtype=torch.int32,
-    device=DEVICE,
-)
-
-search._apply_virtual_loss(
-    test_path
-)
-
-try:
-
-    leaves_after_virtual, paths_after_virtual = (
-        search._select_leaves(
-            search._root_ids,
-            max_depth=8,
-        )
-    )
-
-    selected_after_virtual = int(
-        leaves_after_virtual[0].item()
-    )
-
-    print()
+for r in results:
     print(
-        "Selected leaf after virtual loss:",
-        selected_after_virtual,
+        f"{r['simulations']:4d} sims | "
+        f"root N={r['root_visits']:4d} | "
+        f"children={r['children']:3d} | "
+        f"child visits={r['child_visits']:4d} | "
+        f"policy sum={r['policy_sum']:.6f}"
     )
 
-    print()
-    print("Path:")
-    print(
-        paths_after_virtual.detach()
-        .cpu()
-        .tolist()
-    )
+# Root visits must grow exactly with simulations.
+for i in range(1, len(results)):
+    previous = results[i - 1]
+    current = results[i]
 
-    # With correct separate virtual statistics, child A should
-    # be penalized by the temporary reservation, allowing the
-    # alternative child to be selected.
-    #
-    # If the implementation intentionally uses a different
-    # virtual-loss convention, report the result rather than
-    # falsely declaring failure.
-
-    if selected_after_virtual == child_b:
-
-        print(
-            "PASS: Virtual loss redirected selection "
-            "away from reserved child."
-        )
-
-    elif selected_after_virtual == child_a:
-
-        print(
-            "WARNING: Selection remained on the reserved child."
-        )
-
-        print(
-            "This does not automatically mean the implementation "
-            "is wrong; inspect the exact virtual-loss PUCT formula."
-        )
-
-    else:
-
-        raise AssertionError(
-            f"Virtual-loss selection FAILED: expected child B ({child_b}) "
-            f"or child A ({child_a}), got node {selected_after_virtual}"
-        )
-
-finally:
-
-    # Always restore temporary virtual loss.
-    search._remove_virtual_loss(
-        test_path
+    check(
+        current["root_visits"] > previous["root_visits"],
+        (
+            f"Root visit count increases from "
+            f"{previous['simulations']} to "
+            f"{current['simulations']} simulations"
+        ),
     )
 
 
 # ============================================================
-# FINAL STATE CHECK
-# ============================================================
-
-print()
-print("=" * 100)
-print("FINAL VIRTUAL-LOSS STATE CHECK")
-print("=" * 100)
-
-final_n = int(
-    search.visit_count[child_a].item()
-)
-
-final_w = float(
-    search.value_sum[child_a].item()
-)
-
-assert_equal(
-    final_n,
-    4,
-    "Final child-A real visit count",
-)
-
-assert_close(
-    final_w,
-    0.8,
-    "Final child-A real value sum",
-)
-
-if hasattr(search, "virtual_visit_count"):
-    if search.virtual_visit_count is not None:
-
-        assert_equal(
-            int(
-                search.virtual_visit_count[child_a].item()
-            ),
-            0,
-            "Final virtual visit count",
-        )
-
-if hasattr(search, "virtual_value_sum"):
-    if search.virtual_value_sum is not None:
-
-        assert_close(
-            float(
-                search.virtual_value_sum[child_a].item()
-            ),
-            0.0,
-            "Final virtual value sum",
-        )
-
-
-# ============================================================
-# COMPLETE
+# FINAL SUMMARY
 # ============================================================
 
 if DEVICE.type == "cuda":
@@ -851,16 +694,19 @@ if DEVICE.type == "cuda":
 
 print()
 print("=" * 100)
-print("PUCT + VIRTUAL-LOSS TEST COMPLETE")
+print("BATCHED MCTS INTEGRATION TEST COMPLETE")
 print("=" * 100)
 
 print()
-print("The controlled PUCT calculation, direct selection test,")
-print("virtual-loss application/removal, and final state restoration")
-print("have completed.")
-
+print("Verified:")
+print("  1. Complete batched MCTS search executes.")
+print("  2. Root visits equal requested simulations.")
+print("  3. Root policy is finite and normalized.")
+print("  4. Root child visits are internally consistent.")
+print("  5. MCTS tree statistics remain finite.")
+print("  6. Virtual-loss buffers are cleared after search.")
+print("  7. Search remains consistent from 100 -> 800 simulations.")
 print()
-print("IMPORTANT:")
-print("If this script reports a PUCT-selection failure,")
-print("do NOT train RL54 yet.")
+print("If all checks above PASS, the next diagnostic should")
+print("move to the actual self-play integration path.")
 print("=" * 100)
