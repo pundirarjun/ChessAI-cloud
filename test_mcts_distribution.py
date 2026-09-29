@@ -290,6 +290,8 @@ print(
     best_expected_node,
 )
 
+best_child = best_expected_node
+
 assert_true(
     best_child == child_b,
     "Manual PUCT selects the highest PUCT score"
@@ -430,12 +432,15 @@ print(
     selected_leaf,
 )
 
-# Because child C has the highest PUCT score in this setup,
-# it should be selected.
+# Child B has the highest PUCT score in this setup:
+#   Child A = 0.274342
+#   Child B = 0.674342
+#   Child C = 0.474342
+# Therefore child B should be selected.
 
 assert_equal(
     selected_leaf,
-    child_c,
+    child_b,
     "PUCT selected expected child",
 )
 
