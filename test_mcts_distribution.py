@@ -1060,9 +1060,8 @@ def run_mcts(
 
         # IMPORTANT:
         #
-        # Do NOT pass batch_size here.
-        #
-        # Current GPUMCTS.search() does not take it.
+        # Keep the diagnostic on the default MCTS batch size.
+        # No explicit batch_size is needed here.
 
         search.search(
             root,
@@ -1129,17 +1128,18 @@ def extract_root_stats(
         ]
     )
 
-    visits = (
-        search.visit_count[
+    # IMPORTANT:
+    # visit_count/value_sum are indexed by NODE ID, not EDGE ID.
+    # Root edges must therefore be mapped through edge_child first.
+    child_ids = (
+        search.edge_child[
             edge_start:edge_end
-        ]
+        ].to(torch.long)
     )
 
-    sums = (
-        search.value_sum[
-            edge_start:edge_end
-        ]
-    )
+    visits = search.visit_count[child_ids]
+
+    sums = search.value_sum[child_ids]
 
     root_visits = int(
         search.visit_count[
