@@ -675,8 +675,15 @@ reset_stats(search)
 
 search.visit_count[root] = 10
 
+# Fully clear the root edge slots first so stale edges from
+# previous artificial-tree tests cannot leak into this test.
 search.edge_start[root] = 0
 search.edge_count[root] = 2
+
+search.edge_child[0:3] = -1
+search.edge_action[0:3] = -1
+search.edge_prior[0:3] = 0.0
+search.edge_valid[0:3] = False
 
 search.edge_child[0] = child_a
 search.edge_child[1] = child_b
@@ -770,9 +777,9 @@ try:
 
     else:
 
-        print(
-            "WARNING: Unexpected selected node:",
-            selected_after_virtual,
+        raise AssertionError(
+            f"Virtual-loss selection FAILED: expected child B ({child_b}) "
+            f"or child A ({child_a}), got node {selected_after_virtual}"
         )
 
 finally:
