@@ -57,6 +57,8 @@ class GPUMCTS:
         self.parent = None
         self.visit_count = None
         self.value_sum = None
+        self.virtual_visit_count = None
+        self.virtual_value_sum = None
         self.expanded = None
         self.terminal = None
         self.edge_start = None
@@ -66,13 +68,6 @@ class GPUMCTS:
         self.edge_prior = None
         self.edge_valid = None
         self.edge_used = 0
-
-        # Temporary selection-debug state. This is intentionally kept inside
-        # GPUMCTS so the diagnostic can observe the ACTUAL selection decision
-        # without changing the MCTS scoring or tree update logic.
-        self._debug_select_calls = 0
-        self._debug_trace_actions = (263, 3186)
-        self._debug_trace_limit = 50
 
         # Reused indexing buffers. These avoid allocating the same arange
         # tensors on every tree traversal / root operation.
@@ -107,6 +102,10 @@ class GPUMCTS:
         self.parent = torch.full((self.max_nodes,), -1, dtype=torch.int32, device=dev)
         self.visit_count = torch.zeros((self.max_nodes,), dtype=torch.int32, device=dev)
         self.value_sum = torch.zeros((self.max_nodes,), dtype=torch.float32, device=dev)
+        # Temporary batch-selection statistics. These never enter the real
+        # MCTS visit/value statistics used for training targets.
+        self.virtual_visit_count = torch.zeros((self.max_nodes,), dtype=torch.int32, device=dev)
+        self.virtual_value_sum = torch.zeros((self.max_nodes,), dtype=torch.float32, device=dev)
         self.expanded = torch.zeros((self.max_nodes,), dtype=torch.bool, device=dev)
         self.terminal = torch.zeros((self.max_nodes,), dtype=torch.bool, device=dev)
         self.edge_start = torch.full((self.max_nodes,), -1, dtype=torch.int32, device=dev)
@@ -117,7 +116,6 @@ class GPUMCTS:
         self.edge_prior = torch.zeros((self.max_edges,), dtype=torch.float32, device=dev)
         self.edge_valid = torch.zeros((self.max_edges,), dtype=torch.bool, device=dev)
         self.edge_used = 0
-        self._debug_select_calls = 0
 
         # Cache frequently reused GPU indexing tensors for this search.
         self._child_cols = torch.arange(
@@ -251,24 +249,13 @@ class GPUMCTS:
 
 
     def _select_leaves(self, root_ids: torch.Tensor, max_depth: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select one leaf per root in parallel and return leaf ids + paths.
-
-        TEMPORARY DEBUG VERSION:
-        Traces the *actual* selection decision for actions 263 and 3186.
-        This does not alter PUCT, argmax, tree state, or backup behavior.
-        Remove the debug prints after the MCTS issue is identified.
-        """
+        """Select one leaf per root in parallel and return leaf ids + paths."""
         g = root_ids.numel()
         current = root_ids.clone()
         active = torch.ones((g,), dtype=torch.bool, device=self.device)
         paths = torch.full((g, max_depth + 1), -1, dtype=torch.int32, device=self.device)
         paths[:, 0] = root_ids.to(torch.int32)
         depth = 0
-
-        # One _select_leaves call corresponds to one actual tree traversal.
-        # Keep the trace bounded so a long search does not flood the notebook.
-        trace_this_call = self._debug_select_calls < self._debug_trace_limit
-        self._debug_select_calls += 1
 
         while depth < max_depth:
             selectable = active & self.expanded[current] & ~self.terminal[current] & (self.edge_count[current] > 0)
@@ -283,64 +270,41 @@ class GPUMCTS:
             edge_idx_safe = edge_idx.clamp(0, self.max_edges - 1)
             valid = self.edge_valid[edge_idx_safe]
             child = self.edge_child[edge_idx_safe].to(torch.long)
-            visits = self.visit_count[child].float()
-            sums = self.value_sum[child]
-            q = torch.where(visits > 0, sums / visits, torch.zeros_like(sums))
+            real_visits = self.visit_count[child].float()
+            real_sums = self.value_sum[child]
+            virtual_visits = self.virtual_visit_count[child].float()
+            virtual_sums = self.virtual_value_sum[child]
+
+            effective_visits = real_visits + virtual_visits
+            effective_sums = real_sums + virtual_sums
+            q = torch.where(
+                effective_visits > 0,
+                effective_sums / effective_visits,
+                torch.zeros_like(effective_sums),
+            )
+
             priors = self.edge_prior[edge_idx_safe]
-            parent_visits = self.visit_count[nodes].float().clamp_min(1.0)[:, None]
-            scores = -q + self.c_puct * priors * torch.sqrt(parent_visits) / (1.0 + visits)
+            parent_visits = (
+                self.visit_count[nodes].float()
+                + self.virtual_visit_count[nodes].float()
+            ).clamp_min(1.0)[:, None]
+
+            scores = (
+                -q
+                + self.c_puct * priors * torch.sqrt(parent_visits)
+                / (1.0 + effective_visits)
+            )
             scores = scores.masked_fill(~valid, -torch.inf)
             best = torch.argmax(scores, dim=1)
             next_nodes = child.gather(1, best[:, None]).squeeze(1)
-
-            # --------------------------------------------------------------
-            # TEMPORARY ACTUAL-SELECTION TRACE
-            # --------------------------------------------------------------
-            if trace_this_call:
-                for local_row in range(sel_rows.numel()):
-                    node_id = int(nodes[local_row].item())
-                    best_col = int(best[local_row].item())
-                    selected_action = int(edge_idx_safe[local_row, best_col].item())
-                    # edge_idx is an edge id; recover the actual chess action.
-                    selected_action = int(self.edge_action[edge_idx_safe[local_row, best_col]].item())
-
-                    target_lines = []
-                    for target_action in self._debug_trace_actions:
-                        matches = (self.edge_action[edge_idx_safe[local_row]] == target_action) & valid[local_row]
-                        if bool(matches.any().item()):
-                            pos = int(torch.nonzero(matches, as_tuple=False)[0, 0].item())
-                            target_edge = edge_idx_safe[local_row, pos]
-                            target_lines.append(
-                                f"action={target_action} "
-                                f"P={float(priors[local_row, pos].item()):+.6f} "
-                                f"N={int(visits[local_row, pos].item())} "
-                                f"Q={float(q[local_row, pos].item()):+.6f} "
-                                f"U={float((scores[local_row, pos] + q[local_row, pos]).item()):+.6f} "
-                                f"PUCT={float(scores[local_row, pos].item()):+.6f} "
-                                f"edge={int(target_edge.item())}"
-                            )
-
-                    # Only print nodes containing one of the target actions.
-                    if target_lines:
-                        print("\\n[MCTS DEBUG] ACTUAL SELECTION")
-                        print(f"  select_call={self._debug_select_calls} depth={depth} parent_node={node_id}")
-                        for line in target_lines:
-                            print(f"  TARGET {line}")
-                        print(
-                            f"  SELECTED action={selected_action} "
-                            f"edge={int(edge_idx_safe[local_row, best_col].item())} "
-                            f"child={int(next_nodes[local_row].item())} "
-                            f"P={float(priors[local_row, best_col].item()):+.6f} "
-                            f"N={int(visits[local_row, best_col].item())} "
-                            f"Q={float(q[local_row, best_col].item()):+.6f} "
-                            f"PUCT={float(scores[local_row, best_col].item()):+.6f}"
-                        )
-
             current[sel_rows] = next_nodes
             depth += 1
 
             # Record the node only for rows that actually traversed at this
-            # depth. Do NOT copy the previous node into inactive rows.
+            # depth.  Do NOT copy the previous node into inactive rows: those
+            # rows have already reached their leaf and must remain padded with
+            # -1.  Otherwise batched backup can count the same leaf multiple
+            # times when different games reach leaves at different depths.
             paths[sel_rows, depth] = next_nodes.to(torch.int32)
 
             # Rows that reached an unexpanded/terminal node stop. Others keep
@@ -381,27 +345,40 @@ class GPUMCTS:
         return torch.where(checkmate, -torch.ones_like(states.halfmove_clock, dtype=torch.float32), torch.zeros_like(states.halfmove_clock, dtype=torch.float32))
 
     def _apply_virtual_loss(self, paths: torch.Tensor, loss: float = 1.0):
-        """Temporarily reserve selected paths so parallel selections diverge."""
+        """Reserve selected paths using temporary-only statistics."""
         nodes = paths.reshape(-1).to(torch.long)
-        valid = nodes >= 0
-        nodes = nodes[valid]
+        nodes = nodes[nodes >= 0]
         if nodes.numel() == 0:
             return
-        ones = torch.ones((nodes.numel(),), dtype=torch.int32, device=self.device)
-        losses = torch.full((nodes.numel(),), float(loss), dtype=torch.float32, device=self.device)
-        self.visit_count.index_add_(0, nodes, ones)
-        self.value_sum.index_add_(0, nodes, losses)
+
+        ones = torch.ones(
+            (nodes.numel(),), dtype=torch.int32, device=self.device
+        )
+        losses = torch.full(
+            (nodes.numel(),), float(loss),
+            dtype=torch.float32, device=self.device
+        )
+
+        self.virtual_visit_count.index_add_(0, nodes, ones)
+        self.virtual_value_sum.index_add_(0, nodes, losses)
 
     def _remove_virtual_loss(self, paths: torch.Tensor, loss: float = 1.0):
+        """Remove temporary virtual statistics only."""
         nodes = paths.reshape(-1).to(torch.long)
-        valid = nodes >= 0
-        nodes = nodes[valid]
+        nodes = nodes[nodes >= 0]
         if nodes.numel() == 0:
             return
-        ones = torch.ones((nodes.numel(),), dtype=torch.int32, device=self.device)
-        losses = torch.full((nodes.numel(),), -float(loss), dtype=torch.float32, device=self.device)
-        self.visit_count.index_add_(0, nodes, -ones)
-        self.value_sum.index_add_(0, nodes, losses)
+
+        ones = torch.ones(
+            (nodes.numel(),), dtype=torch.int32, device=self.device
+        )
+        losses = torch.full(
+            (nodes.numel(),), -float(loss),
+            dtype=torch.float32, device=self.device
+        )
+
+        self.virtual_visit_count.index_add_(0, nodes, -ones)
+        self.virtual_value_sum.index_add_(0, nodes, losses)
 
     def _backup_batched(self, paths: torch.Tensor, values: torch.Tensor):
         """GPU backup for [batch, games, depth] paths with variable lengths."""
@@ -497,6 +474,11 @@ class GPUMCTS:
 
             # Remove temporary virtual losses before applying real backups.
             self._remove_virtual_loss(paths)
+
+            if torch.any(self.virtual_visit_count != 0):
+                raise RuntimeError("Virtual visit statistics were not fully removed.")
+            if torch.any(self.virtual_value_sum != 0):
+                raise RuntimeError("Virtual value statistics were not fully removed.")
 
             flat_leaves = leaves.reshape(-1)
             terminal = self.terminal[flat_leaves]
