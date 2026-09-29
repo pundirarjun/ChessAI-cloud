@@ -52,12 +52,12 @@ from training.train_step import train_from_replay_buffer
 # Iteration / paths
 # ---------------------------------------------------------------------------
 
-RL_ITERATION = 51
+RL_ITERATION = 52
 
 PREVIOUS_ITERATION = RL_ITERATION - 1
 
 KAGGLE_CHECKPOINT_ROOT = (
-    "/kaggle/input/datasets/arjunthakur9999/checkpoints/chess_checkpoints (3)"
+    "/kaggle/working/chess-zero/checkpoints"
 )
 
 LOCAL_CHECKPOINT_ROOT = "checkpoints"
@@ -363,7 +363,8 @@ def generate_self_play_data(
         completed += 1
 
         replay_buffer.add(
-            result.training_data
+            result.training_data,
+            source_iteration=RL_ITERATION,
         )
 
         new_samples += len(
@@ -701,6 +702,10 @@ def main():
         len(replay),
     )
 
+    # Show the source-iteration distribution before new self-play data is added.
+    print("\nReplay buffer before self-play:")
+    replay.print_iteration_distribution()
+
     # -------------------------------------------------------
     # SELF-PLAY
     # -------------------------------------------------------
@@ -716,6 +721,10 @@ def main():
     # -------------------------------------------------------
     # SAVE REPLAY
     # -------------------------------------------------------
+
+    # Show exactly what survived FIFO after adding this iteration's samples.
+    print("\nReplay buffer after self-play:")
+    replay.print_iteration_distribution()
 
     save_replay_buffer(
         replay,
