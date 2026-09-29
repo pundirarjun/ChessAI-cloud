@@ -1,8 +1,8 @@
 import torch
+import numpy as np
 import random
 
 from model.chess_net import ChessNet
-from environment.gpu_chess import GPUChess
 
 
 # ============================================================
@@ -38,7 +38,6 @@ print(f"Device: {DEVICE}")
 print(f"Checkpoint: {CHECKPOINT}")
 print(f"Replay buffer: {REPLAY_BUFFER}")
 
-
 model = ChessNet().to(DEVICE)
 
 checkpoint = torch.load(
@@ -48,10 +47,13 @@ checkpoint = torch.load(
 )
 
 if "model_state_dict" in checkpoint:
+
     model.load_state_dict(
         checkpoint["model_state_dict"]
     )
+
 else:
+
     model.load_state_dict(checkpoint)
 
 model.eval()
@@ -79,43 +81,52 @@ print(f"Replay buffer type: {type(buffer)}")
 # ============================================================
 
 if hasattr(buffer, "buffer"):
+
     samples = list(buffer.buffer)
 
 elif isinstance(buffer, (list, tuple)):
+
     samples = list(buffer)
 
 elif isinstance(buffer, dict):
 
     if "buffer" in buffer:
+
         samples = list(buffer["buffer"])
 
     elif "samples" in buffer:
+
         samples = list(buffer["samples"])
 
     else:
+
         raise RuntimeError(
             f"Unknown replay-buffer dictionary keys: "
             f"{buffer.keys()}"
         )
 
 else:
+
     raise RuntimeError(
         f"Unknown replay buffer type: {type(buffer)}"
     )
 
 
-print(f"Total replay samples: {len(samples)}")
+print(
+    f"Total replay samples: {len(samples)}"
+)
 
 
 if len(samples) < NUM_POSITIONS:
+
     raise RuntimeError(
-        f"Replay buffer contains only {len(samples)} "
-        f"samples."
+        f"Replay buffer contains only "
+        f"{len(samples)} samples."
     )
 
 
 # ============================================================
-# INSPECT SAMPLE STRUCTURE
+# VERIFY SAMPLE STRUCTURE
 # ============================================================
 
 print("\n")
@@ -125,118 +136,46 @@ print("=" * 70)
 
 example = samples[0]
 
-print(f"Sample type: {type(example)}")
+print(
+    f"Sample type: {type(example)}"
+)
 
-if hasattr(example, "__dict__"):
-    print("Sample attributes:")
-
-    for key, value in example.__dict__.items():
-        if torch.is_tensor(value):
-            print(
-                f"  {key}: "
-                f"Tensor shape={tuple(value.shape)}, "
-                f"dtype={value.dtype}"
-            )
-        else:
-            print(
-                f"  {key}: "
-                f"{type(value).__name__} = {value}"
-            )
-
-elif isinstance(example, dict):
-
-    print("Sample dictionary:")
-
-    for key, value in example.items():
-
-        if torch.is_tensor(value):
-            print(
-                f"  {key}: "
-                f"Tensor shape={tuple(value.shape)}, "
-                f"dtype={value.dtype}"
-            )
-
-        else:
-            print(
-                f"  {key}: "
-                f"{type(value).__name__}"
-            )
-
-elif isinstance(example, (tuple, list)):
-
-    print(
-        f"Sample contains {len(example)} elements:"
-    )
-
-    for i, value in enumerate(example):
-
-        if torch.is_tensor(value):
-            print(
-                f"  [{i}]: "
-                f"Tensor shape={tuple(value.shape)}, "
-                f"dtype={value.dtype}"
-            )
-
-        else:
-            print(
-                f"  [{i}]: "
-                f"{type(value).__name__}"
-            )
-
-
-# ============================================================
-# GET STATE FROM REPLAY SAMPLE
-# ============================================================
-
-def get_state(sample):
-
-    """
-    Extract the chess state from a replay sample.
-
-    The diagnostic handles the common formats used
-    by the project.
-    """
-
-    # --------------------------------------------------------
-    # Object-style sample
-    # --------------------------------------------------------
-
-    if hasattr(sample, "state"):
-
-        return sample.state
-
-    # --------------------------------------------------------
-    # Dictionary-style sample
-    # --------------------------------------------------------
-
-    if isinstance(sample, dict):
-
-        for key in [
-            "state",
-            "board",
-            "observation",
-            "state_tensor",
-        ]:
-
-            if key in sample:
-                return sample[key]
-
-    # --------------------------------------------------------
-    # Tuple/list style
-    # --------------------------------------------------------
-
-    if isinstance(sample, (tuple, list)):
-
-        # Normally state is first element.
-        return sample[0]
+if not isinstance(example, (tuple, list)):
 
     raise RuntimeError(
-        "Could not determine state from replay sample."
+        "Expected replay sample to be a tuple/list."
     )
 
 
+if len(example) != 3:
+
+    raise RuntimeError(
+        f"Expected 3 elements but found "
+        f"{len(example)}"
+    )
+
+
+example_state = example[0]
+example_policy = example[1]
+example_value = example[2]
+
+print(
+    f"State:  shape={example_state.shape}, "
+    f"dtype={example_state.dtype}"
+)
+
+print(
+    f"Policy: shape={example_policy.shape}, "
+    f"dtype={example_policy.dtype}"
+)
+
+print(
+    f"Value:  {example_value}"
+)
+
+
 # ============================================================
-# SELECT RANDOM REAL POSITIONS
+# SELECT REAL REPLAY POSITIONS
 # ============================================================
 
 print("\n")
@@ -251,69 +190,98 @@ selected_samples = random.sample(
     NUM_POSITIONS,
 )
 
-states_raw = []
+
+# ============================================================
+# EXTRACT STATE + TARGET POLICY + VALUE
+# ============================================================
+
+states_np = []
+target_policies_np = []
+values_np = []
 
 for sample in selected_samples:
 
-    state = get_state(sample)
+    # Replay format:
+    #
+    # sample[0] = state
+    # sample[1] = MCTS target policy
+    # sample[2] = value
 
-    states_raw.append(state)
+    state = sample[0]
+
+    target_policy = sample[1]
+
+    value = sample[2]
+
+    states_np.append(
+        np.asarray(state)
+    )
+
+    target_policies_np.append(
+        np.asarray(target_policy)
+    )
+
+    values_np.append(
+        float(value)
+    )
 
 
 # ============================================================
-# CONVERT STATES
+# CONVERT TO TORCH
 # ============================================================
 
-print("Converting replay states...")
+states = torch.from_numpy(
+    np.stack(states_np)
+).float().to(DEVICE)
+
+target_policy = torch.from_numpy(
+    np.stack(target_policies_np)
+).float().to(DEVICE)
+
+target_values = torch.tensor(
+    values_np,
+    dtype=torch.float32,
+    device=DEVICE,
+)
 
 
-# ------------------------------------------------------------
-# Case 1: already GPUChess
-# ------------------------------------------------------------
+print(
+    f"\nState batch shape: "
+    f"{tuple(states.shape)}"
+)
 
-if all(
-    isinstance(x, GPUChess)
-    for x in states_raw
-):
+print(
+    f"Target policy shape: "
+    f"{tuple(target_policy.shape)}"
+)
 
-    # Usually not expected after torch.load,
-    # but supported.
-    states = states_raw
-
-
-# ------------------------------------------------------------
-# Case 2: state tensors
-# ------------------------------------------------------------
-
-elif torch.is_tensor(states_raw[0]):
-
-    state_tensor = torch.stack(
-        [
-            x.float()
-            for x in states_raw
-        ]
-    )
-
-    print(
-        f"State tensor shape: "
-        f"{tuple(state_tensor.shape)}"
-    )
-
-    raise RuntimeError(
-        "\nYour replay buffer stores encoded state tensors "
-        "rather than GPUChess board states.\n\n"
-        "Send me the 'REPLAY SAMPLE STRUCTURE' output above "
-        "and I will adapt the conversion exactly to your "
-        "replay-buffer format."
-    )
+print(
+    f"Target values shape: "
+    f"{tuple(target_values.shape)}"
+)
 
 
-else:
+# ============================================================
+# VERIFY STATE SHAPE
+# ============================================================
+
+if states.ndim != 4:
 
     raise RuntimeError(
-        f"Unsupported replay state type: "
-        f"{type(states_raw[0])}"
+        f"Expected states to have 4 dimensions "
+        f"[batch, channels, height, width]. "
+        f"Got {tuple(states.shape)}"
     )
+
+
+print(
+    f"State channels: {states.shape[1]}"
+)
+
+print(
+    f"Board size: "
+    f"{states.shape[2]} x {states.shape[3]}"
+)
 
 
 # ============================================================
@@ -322,21 +290,19 @@ else:
 
 print("\n")
 print("=" * 70)
-print("RAW RL53 POLICY ON REAL GAME POSITIONS")
+print("RAW RL53 POLICY ON REAL REPLAY POSITIONS")
 print("=" * 70)
 
 
 with torch.inference_mode():
 
-    model_input = states.to_model_input()
+    model_input = states
 
-    if model_input.is_cuda:
+    if DEVICE.type == "cuda":
 
         model_input = model_input.contiguous(
             memory_format=torch.channels_last
         )
-
-    if DEVICE.type == "cuda":
 
         with torch.autocast(
             device_type="cuda",
@@ -353,203 +319,424 @@ with torch.inference_mode():
             model_input
         )
 
-    # --------------------------------------------------------
-    # Legal moves
-    # --------------------------------------------------------
-
-    legal = states.legal_move_mask()
-
-    # --------------------------------------------------------
-    # Mask illegal actions
-    # --------------------------------------------------------
-
-    masked_logits = logits.float().masked_fill(
-        ~legal,
-        torch.finfo(torch.float32).min,
-    )
-
-    # --------------------------------------------------------
-    # Policy
-    # --------------------------------------------------------
-
-    policy = torch.softmax(
-        masked_logits,
-        dim=1,
-    )
-
 
 # ============================================================
-# METRICS
+# POLICY FROM NETWORK
 # ============================================================
 
-safe_policy = policy.clamp_min(1e-12)
-
-entropy = -(
-    safe_policy * safe_policy.log()
-).sum(dim=1)
-
-num_legal = legal.sum(
-    dim=1
-).float()
-
-normalized_entropy = (
-    entropy /
-    torch.log(num_legal.clamp_min(2))
+network_policy = torch.softmax(
+    logits.float(),
+    dim=1,
 )
 
-max_probability = policy.max(
-    dim=1
-).values
+
+# ============================================================
+# IMPORTANT:
+# MASK ONLY ACTIONS THAT ARE ZERO IN THE STORED TARGET
+# ============================================================
+#
+# The replay target policy contains non-zero probability
+# only on legal moves that MCTS considered.
+#
+# Therefore we use its support as the legal-action mask.
+#
+# This avoids reconstructing GPUChess states.
+# ============================================================
+
+target_mask = target_policy > 0
 
 
 # ============================================================
-# RESULTS
+# NETWORK POLICY OVER TARGET'S LEGAL ACTIONS
 # ============================================================
+
+masked_logits = logits.float().masked_fill(
+    ~target_mask,
+    torch.finfo(torch.float32).min,
+)
+
+network_policy_legal = torch.softmax(
+    masked_logits,
+    dim=1,
+)
+
+
+# ============================================================
+# METRIC FUNCTION
+# ============================================================
+
+def calculate_metrics(
+    policy,
+    mask,
+):
+
+    safe_policy = policy.clamp_min(
+        1e-12
+    )
+
+    entropy = -(
+        policy * safe_policy.log()
+    ).sum(dim=1)
+
+    num_actions = mask.sum(
+        dim=1
+    ).float()
+
+    normalized_entropy = (
+        entropy /
+        torch.log(
+            num_actions.clamp_min(2)
+        )
+    )
+
+    max_probability = policy.max(
+        dim=1
+    ).values
+
+    return {
+        "entropy":
+            entropy.mean().item(),
+
+        "normalized_entropy":
+            normalized_entropy.mean().item(),
+
+        "max_probability":
+            max_probability.mean().item(),
+
+        "num_actions":
+            num_actions.mean().item(),
+
+        "entropy_each":
+            entropy,
+
+        "normalized_each":
+            normalized_entropy,
+
+        "max_each":
+            max_probability,
+    }
+
+
+# ============================================================
+# RAW NETWORK METRICS
+# ============================================================
+
+network_metrics = calculate_metrics(
+    network_policy_legal,
+    target_mask,
+)
+
+
+# ============================================================
+# TARGET POLICY METRICS
+# ============================================================
+
+target_metrics = calculate_metrics(
+    target_policy,
+    target_mask,
+)
+
+
+# ============================================================
+# PRINT NETWORK RESULTS
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("NETWORK POLICY")
+print("=" * 70)
 
 print(
-    f"\nAverage legal moves: "
-    f"{num_legal.mean().item():.2f}"
+    f"Average target-supported actions: "
+    f"{network_metrics['num_actions']:.2f}"
 )
 
 print(
     f"Entropy: "
-    f"{entropy.mean().item():.4f}"
+    f"{network_metrics['entropy']:.4f}"
 )
 
 print(
     f"Normalized entropy: "
-    f"{normalized_entropy.mean().item():.4f}"
+    f"{network_metrics['normalized_entropy']:.4f}"
 )
 
 print(
     f"Max probability: "
-    f"{max_probability.mean().item():.4f}"
-)
-
-print(
-    f"Max probability min: "
-    f"{max_probability.min().item():.4f}"
-)
-
-print(
-    f"Max probability max: "
-    f"{max_probability.max().item():.4f}"
+    f"{network_metrics['max_probability']:.4f}"
 )
 
 
 # ============================================================
-# POSITION-BY-POSITION RESULTS
+# PRINT MCTS TARGET RESULTS
 # ============================================================
 
 print("\n")
-print("=" * 90)
+print("=" * 70)
+print("STORED MCTS TARGET POLICY")
+print("=" * 70)
+
+print(
+    f"Average actions: "
+    f"{target_metrics['num_actions']:.2f}"
+)
+
+print(
+    f"Entropy: "
+    f"{target_metrics['entropy']:.4f}"
+)
+
+print(
+    f"Normalized entropy: "
+    f"{target_metrics['normalized_entropy']:.4f}"
+)
+
+print(
+    f"Max probability: "
+    f"{target_metrics['max_probability']:.4f}"
+)
+
+
+# ============================================================
+# POLICY CROSS-ENTROPY
+# ============================================================
+
+target_safe = target_policy.clamp_min(
+    1e-12
+)
+
+network_log_probs = torch.log(
+    network_policy_legal.clamp_min(1e-12)
+)
+
+cross_entropy = -(
+    target_policy *
+    network_log_probs
+).sum(dim=1)
+
+
+print("\n")
+print("=" * 70)
+print("NETWORK vs MCTS TARGET")
+print("=" * 70)
+
+print(
+    f"Policy cross-entropy: "
+    f"{cross_entropy.mean().item():.4f}"
+)
+
+
+# ============================================================
+# KL DIVERGENCE
+# ============================================================
+
+kl_divergence = (
+    target_policy *
+    (
+        torch.log(
+            target_policy.clamp_min(1e-12)
+        )
+        -
+        torch.log(
+            network_policy_legal.clamp_min(1e-12)
+        )
+    )
+).sum(dim=1)
+
+
+print(
+    f"KL(target || network): "
+    f"{kl_divergence.mean().item():.4f}"
+)
+
+
+# ============================================================
+# VALUE COMPARISON
+# ============================================================
+
+network_values = values.squeeze(-1).float()
+
+value_mse = torch.mean(
+    (
+        network_values -
+        target_values
+    ) ** 2
+)
+
+print(
+    f"Value MSE: "
+    f"{value_mse.item():.4f}"
+)
+
+
+# ============================================================
+# POSITION-BY-POSITION
+# ============================================================
+
+print("\n")
+print("=" * 110)
 print("POSITION-BY-POSITION RESULTS")
-print("=" * 90)
+print("=" * 110)
 
 print(
     f"{'Pos':>5}"
-    f"{'Legal':>10}"
-    f"{'Entropy':>12}"
-    f"{'Norm Ent':>12}"
-    f"{'Max Prob':>12}"
+    f"{'Actions':>10}"
+    f"{'Net Ent':>12}"
+    f"{'Net Norm':>12}"
+    f"{'Net Max':>12}"
+    f"{'Target Ent':>13}"
+    f"{'Target Norm':>14}"
+    f"{'Target Max':>13}"
 )
 
-print("-" * 90)
+print("-" * 110)
 
 for i in range(NUM_POSITIONS):
 
     print(
         f"{i + 1:>5}"
-        f"{int(num_legal[i].item()):>10}"
-        f"{entropy[i].item():>12.4f}"
-        f"{normalized_entropy[i].item():>12.4f}"
-        f"{max_probability[i].item():>12.4f}"
+        f"{int(network_metrics['num_actions'] if False else target_mask[i].sum().item()):>10}"
+        f"{network_metrics['entropy_each'][i].item():>12.4f}"
+        f"{network_metrics['normalized_each'][i].item():>12.4f}"
+        f"{network_metrics['max_each'][i].item():>12.4f}"
+        f"{target_metrics['entropy_each'][i].item():>13.4f}"
+        f"{target_metrics['normalized_each'][i].item():>14.4f}"
+        f"{target_metrics['max_each'][i].item():>13.4f}"
     )
 
 
 # ============================================================
-# TOP MOVES
+# TOP NETWORK vs TARGET MOVES
 # ============================================================
 
 print("\n")
 print("=" * 70)
-print("TOP NETWORK MOVES")
+print("TOP NETWORK vs MCTS TARGET")
 print("=" * 70)
+
 
 for position in range(
     min(5, NUM_POSITIONS)
 ):
 
+    mask = target_mask[position]
+
     legal_actions = torch.nonzero(
-        legal[position],
+        mask,
         as_tuple=False,
     ).flatten()
 
-    legal_probs = policy[
+    # --------------------------------------------------------
+    # Network probabilities
+    # --------------------------------------------------------
+
+    net_probs = network_policy_legal[
         position,
         legal_actions,
     ]
 
-    top_k = min(
-        10,
+    net_top_k = min(
+        5,
         legal_actions.numel(),
     )
 
-    top_probs, top_indices = torch.topk(
-        legal_probs,
-        k=top_k,
+    net_top_probs, net_indices = torch.topk(
+        net_probs,
+        k=net_top_k,
     )
 
-    top_actions = legal_actions[
-        top_indices
+    net_top_actions = legal_actions[
+        net_indices
+    ]
+
+    # --------------------------------------------------------
+    # Target probabilities
+    # --------------------------------------------------------
+
+    target_probs = target_policy[
+        position,
+        legal_actions,
+    ]
+
+    target_top_k = min(
+        5,
+        legal_actions.numel(),
+    )
+
+    target_top_probs, target_indices = torch.topk(
+        target_probs,
+        k=target_top_k,
+    )
+
+    target_top_actions = legal_actions[
+        target_indices
     ]
 
     print(
-        f"\nPosition {position + 1}:"
+        f"\nPosition {position + 1}"
     )
 
-    for rank in range(top_k):
+    print("\n  NETWORK:")
 
-        action = top_actions[
-            rank
-        ].item()
-
-        probability = top_probs[
-            rank
-        ].item()
+    for rank in range(net_top_k):
 
         print(
-            f"  {rank + 1:2d}. "
-            f"Action {action:4d} "
-            f"Probability "
-            f"{probability:.4f}"
+            f"    {rank + 1}. "
+            f"Action "
+            f"{net_top_actions[rank].item():4d} "
+            f"Prob "
+            f"{net_top_probs[rank].item():.4f}"
+        )
+
+    print("\n  MCTS TARGET:")
+
+    for rank in range(target_top_k):
+
+        print(
+            f"    {rank + 1}. "
+            f"Action "
+            f"{target_top_actions[rank].item():4d} "
+            f"Prob "
+            f"{target_top_probs[rank].item():.4f}"
         )
 
 
 # ============================================================
-# INTERPRETATION
+# SUMMARY
 # ============================================================
 
 print("\n")
 print("=" * 70)
-print("WHAT THIS TEST TELLS US")
+print("SUMMARY")
 print("=" * 70)
 
 print(
-    """
-This test uses real positions sampled from the RL53
-replay buffer rather than the initial chess position.
+    f"""
+RL53 network:
+    Normalized entropy = "
+    {network_metrics['normalized_entropy']:.4f}
 
-If normalized entropy remains around 0.95-1.00
-across real positions, the RL53 policy is very diffuse.
+    Max probability = "
+    {network_metrics['max_probability']:.4f}
 
-If entropy becomes substantially lower on real
-middle-game/tactical positions, the opening-position
-result was not representative.
 
-The next step after this test is to compare these
-network policies against the MCTS target policies
-stored in the replay buffer.
+Stored MCTS targets:
+    Normalized entropy = "
+    {target_metrics['normalized_entropy']:.4f}
+
+    Max probability = "
+    {target_metrics['max_probability']:.4f}
+
+
+Network vs target:
+    Cross-entropy = "
+    {cross_entropy.mean().item():.4f}
+
+    KL(target || network) = "
+    {kl_divergence.mean().item():.4f}
+
+    Value MSE = "
+    {value_mse.item():.4f}
 """
 )
 
