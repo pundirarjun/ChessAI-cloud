@@ -1,743 +1,1152 @@
-import torch
-import numpy as np
+# ============================================================
+# RL53 NETWORK vs MCTS DIAGNOSTIC
+#
+# Purpose:
+#   Compare the neural-network policy with MCTS on the EXACT
+#   same positions from the RL53 replay buffer.
+#
+# Tests:
+#   100 MCTS simulations
+#   200 MCTS simulations
+#   400 MCTS simulations
+#
+# Dirichlet noise: OFF
+#
+# Metrics:
+#   - Network entropy
+#   - MCTS entropy
+#   - Network max probability
+#   - MCTS max probability
+#   - KL(Network || MCTS)
+#   - KL(MCTS || Network)
+#   - Pearson correlation
+#   - Spearman correlation
+#   - Top-1 agreement
+#   - Average number of legal moves
+# ============================================================
+
+import os
+import sys
+import math
 import random
+import numpy as np
+import torch
+import torch.nn.functional as F
 
-from model.chess_net import ChessNet
-
-
-# ============================================================
+# ------------------------------------------------------------
 # CONFIG
-# ============================================================
+# ------------------------------------------------------------
 
-CHECKPOINT = (
-    "/kaggle/working/chess-zero/checkpoints/"
+PROJECT_ROOT = "/kaggle/working/chess-zero"
+
+CHECKPOINT = os.path.join(
+    PROJECT_ROOT,
+    "checkpoints",
     "rl_iteration_53.pt"
 )
 
-REPLAY_BUFFER = (
-    "/kaggle/working/chess-zero/checkpoints/"
+REPLAY_BUFFER = os.path.join(
+    PROJECT_ROOT,
+    "checkpoints",
     "replay_buffer_rl53.pt"
-)
-
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
 )
 
 NUM_POSITIONS = 32
 
+MCTS_SIMULATIONS = [100, 200, 400]
 
-# ============================================================
+MCTS_BATCH_SIZE = 16
+
+SEED = 42
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("=" * 70)
+print("RL53 NETWORK vs MCTS DIAGNOSTIC")
+print("=" * 70)
+
+print(f"Project:     {PROJECT_ROOT}")
+print(f"Checkpoint:  {CHECKPOINT}")
+print(f"Replay:      {REPLAY_BUFFER}")
+print(f"Device:      {DEVICE}")
+print(f"Positions:   {NUM_POSITIONS}")
+print(f"MCTS tests:  {MCTS_SIMULATIONS}")
+print(f"Noise:       OFF")
+print("=" * 70)
+
+
+# ------------------------------------------------------------
+# CUDA INFORMATION
+# ------------------------------------------------------------
+
+if DEVICE.type == "cuda":
+    print(f"GPU:         {torch.cuda.get_device_name(0)}")
+    print(f"CUDA:        {torch.version.cuda}")
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+torch.set_grad_enabled(False)
+
+
+# ------------------------------------------------------------
+# IMPORT PROJECT
+# ------------------------------------------------------------
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from model.chess_net import ChessNet
+from environment.gpu_chess import GPUChess
+from mcts.gpu_mcts import GPUMCTS
+
+
+# ------------------------------------------------------------
 # LOAD MODEL
-# ============================================================
+# ------------------------------------------------------------
 
-print("=" * 70)
-print("RL53 REPLAY BUFFER POLICY DIAGNOSTIC")
-print("=" * 70)
-
-print(f"Device: {DEVICE}")
-print(f"Checkpoint: {CHECKPOINT}")
-print(f"Replay buffer: {REPLAY_BUFFER}")
+print("\nLoading RL53 model...")
 
 model = ChessNet().to(DEVICE)
 
 checkpoint = torch.load(
     CHECKPOINT,
     map_location=DEVICE,
-    weights_only=False,
+    weights_only=False
 )
 
-if "model_state_dict" in checkpoint:
+print("Checkpoint type:", type(checkpoint))
 
-    model.load_state_dict(
-        checkpoint["model_state_dict"]
-    )
+# Handle common checkpoint formats.
+if isinstance(checkpoint, dict):
+
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+
+    elif "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+
+    elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
+        state_dict = checkpoint["model"]
+
+    else:
+        # Assume the dictionary itself is the state dict.
+        state_dict = checkpoint
 
 else:
+    raise RuntimeError(
+        f"Unsupported checkpoint format: {type(checkpoint)}"
+    )
 
-    model.load_state_dict(checkpoint)
+# Remove possible torch.compile prefix.
+clean_state_dict = {}
+
+for key, value in state_dict.items():
+
+    if key.startswith("_orig_mod."):
+        key = key[len("_orig_mod."):]
+
+    clean_state_dict[key] = value
+
+
+missing, unexpected = model.load_state_dict(
+    clean_state_dict,
+    strict=False
+)
+
+print(f"Missing keys:    {len(missing)}")
+print(f"Unexpected keys: {len(unexpected)}")
+
+if missing:
+    print("Missing:", missing[:10])
+
+if unexpected:
+    print("Unexpected:", unexpected[:10])
 
 model.eval()
 
-print("Model loaded.")
+print("RL53 model loaded successfully.")
 
 
-# ============================================================
+# ------------------------------------------------------------
 # LOAD REPLAY BUFFER
-# ============================================================
+# ------------------------------------------------------------
 
-print("\nLoading replay buffer...")
+print("\nLoading RL53 replay buffer...")
 
-buffer = torch.load(
+replay = torch.load(
     REPLAY_BUFFER,
     map_location="cpu",
-    weights_only=False,
+    weights_only=False
 )
 
-print(f"Replay buffer type: {type(buffer)}")
+print("Replay object type:", type(replay))
+print("Replay size:", len(replay))
 
 
-# ============================================================
-# EXTRACT SAMPLES
-# ============================================================
+# ------------------------------------------------------------
+# INSPECT ONE SAMPLE
+# ------------------------------------------------------------
 
-if hasattr(buffer, "buffer"):
+sample0 = replay[0]
 
-    samples = list(buffer.buffer)
+print("\nSample structure:")
+print("Type:", type(sample0))
+print("Length:", len(sample0))
 
-elif isinstance(buffer, (list, tuple)):
-
-    samples = list(buffer)
-
-elif isinstance(buffer, dict):
-
-    if "buffer" in buffer:
-
-        samples = list(buffer["buffer"])
-
-    elif "samples" in buffer:
-
-        samples = list(buffer["samples"])
-
+for i, x in enumerate(sample0):
+    if hasattr(x, "shape"):
+        print(
+            f"[{i}] shape={x.shape}, "
+            f"dtype={x.dtype}"
+        )
     else:
-
-        raise RuntimeError(
-            f"Unknown replay-buffer dictionary keys: "
-            f"{buffer.keys()}"
+        print(
+            f"[{i}] type={type(x)}, "
+            f"value={x}"
         )
 
-else:
 
-    raise RuntimeError(
-        f"Unknown replay buffer type: {type(buffer)}"
+# ------------------------------------------------------------
+# SAMPLE POSITIONS
+# ------------------------------------------------------------
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+indices = random.sample(
+    range(len(replay)),
+    NUM_POSITIONS
+)
+
+samples = [replay[i] for i in indices]
+
+print("\nSelected replay positions:")
+print(indices)
+
+
+# ------------------------------------------------------------
+# CONVERT REPLAY STATE -> GPUChess
+# ------------------------------------------------------------
+#
+# Stored state:
+#
+#   [18, 8, 8]
+#
+# GPUChess model input:
+#
+#   0-11  = piece planes
+#   12    = white turn
+#   13    = white kingside castling
+#   14    = white queenside castling
+#   15    = black kingside castling
+#   16    = black queenside castling
+#   17    = en-passant square
+#
+# Important:
+#
+# Replay states do NOT store halfmove/fullmove counters.
+# We therefore initialize those to 0/1.
+#
+# This diagnostic is about policy/MCTS behavior, so that does
+# not affect the ordinary positions except the 50-move rule.
+# ------------------------------------------------------------
+
+def replay_states_to_gpu_chess(samples, device):
+
+    states_np = np.stack(
+        [np.asarray(s[0], dtype=np.float32) for s in samples],
+        axis=0
     )
 
-
-print(
-    f"Total replay samples: {len(samples)}"
-)
-
-
-if len(samples) < NUM_POSITIONS:
-
-    raise RuntimeError(
-        f"Replay buffer contains only "
-        f"{len(samples)} samples."
+    states = torch.from_numpy(states_np).to(
+        device=device,
+        dtype=torch.float32
     )
 
+    B = states.shape[0]
 
-# ============================================================
-# VERIFY SAMPLE STRUCTURE
-# ============================================================
+    if states.shape != (B, 18, 8, 8):
+        raise ValueError(
+            f"Unexpected state shape: {states.shape}"
+        )
 
-print("\n")
-print("=" * 70)
-print("REPLAY SAMPLE STRUCTURE")
-print("=" * 70)
-
-example = samples[0]
-
-print(
-    f"Sample type: {type(example)}"
-)
-
-if not isinstance(example, (tuple, list)):
-
-    raise RuntimeError(
-        "Expected replay sample to be a tuple/list."
+    chess = GPUChess(
+        device=device,
+        batch_size=B
     )
 
+    # --------------------------------------------------------
+    # PIECE PLANES
+    # --------------------------------------------------------
 
-if len(example) != 3:
-
-    raise RuntimeError(
-        f"Expected 3 elements but found "
-        f"{len(example)}"
-    )
-
-
-example_state = example[0]
-example_policy = example[1]
-example_value = example[2]
-
-print(
-    f"State:  shape={example_state.shape}, "
-    f"dtype={example_state.dtype}"
-)
-
-print(
-    f"Policy: shape={example_policy.shape}, "
-    f"dtype={example_policy.dtype}"
-)
-
-print(
-    f"Value:  {example_value}"
-)
-
-
-# ============================================================
-# SELECT REAL REPLAY POSITIONS
-# ============================================================
-
-print("\n")
-print("=" * 70)
-print("SELECTING REAL REPLAY POSITIONS")
-print("=" * 70)
-
-random.seed(42)
-
-selected_samples = random.sample(
-    samples,
-    NUM_POSITIONS,
-)
-
-
-# ============================================================
-# EXTRACT STATE + TARGET POLICY + VALUE
-# ============================================================
-
-states_np = []
-target_policies_np = []
-values_np = []
-
-for sample in selected_samples:
-
-    # Replay format:
     #
-    # sample[0] = state
-    # sample[1] = MCTS target policy
-    # sample[2] = value
+    # GPUChess uses:
+    #
+    # square = rank * 8 + file
+    #
+    # Model representation uses:
+    #
+    # row = 7 - rank
+    #
+    # Therefore flip the row dimension back.
+    #
 
-    state = sample[0]
+    board_planes = states[:, :12].flip(2)
 
-    target_policy = sample[1]
+    # GPUChess square bit values.
+    square_bits = chess.square_bits
 
-    value = sample[2]
-
-    states_np.append(
-        np.asarray(state)
+    pieces = torch.zeros(
+        (B, 12),
+        dtype=torch.int64,
+        device=device
     )
 
-    target_policies_np.append(
-        np.asarray(target_policy)
+    # Build each bitboard.
+    for p in range(12):
+
+        occupancy = board_planes[:, p].reshape(
+            B, 64
+        ) > 0.5
+
+        bb = torch.zeros(
+            (B,),
+            dtype=torch.int64,
+            device=device
+        )
+
+        for sq in range(64):
+
+            bb = torch.where(
+                occupancy[:, sq],
+                bb | square_bits[sq],
+                bb
+            )
+
+        pieces[:, p] = bb
+
+    chess.pieces = pieces
+
+    # --------------------------------------------------------
+    # SIDE TO MOVE
+    # --------------------------------------------------------
+
+    # Plane 12 = white_to_move
+    white_to_move = states[:, 12, 0, 0] > 0.5
+
+    # GPUChess turn:
+    #   False = white
+    #   True  = black
+    chess.turn = ~white_to_move
+
+    # --------------------------------------------------------
+    # CASTLING RIGHTS
+    # --------------------------------------------------------
+
+    castling = torch.zeros(
+        (B,),
+        dtype=torch.int16,
+        device=device
     )
 
-    values_np.append(
-        float(value)
+    WK = 1
+    WQ = 2
+    BK = 4
+    BQ = 8
+
+    castling |= torch.where(
+        states[:, 13, 0, 0] > 0.5,
+        torch.tensor(WK, dtype=torch.int16, device=device),
+        torch.tensor(0, dtype=torch.int16, device=device)
+    )
+
+    castling |= torch.where(
+        states[:, 14, 0, 0] > 0.5,
+        torch.tensor(WQ, dtype=torch.int16, device=device),
+        torch.tensor(0, dtype=torch.int16, device=device)
+    )
+
+    castling |= torch.where(
+        states[:, 15, 0, 0] > 0.5,
+        torch.tensor(BK, dtype=torch.int16, device=device),
+        torch.tensor(0, dtype=torch.int16, device=device)
+    )
+
+    castling |= torch.where(
+        states[:, 16, 0, 0] > 0.5,
+        torch.tensor(BQ, dtype=torch.int16, device=device),
+        torch.tensor(0, dtype=torch.int16, device=device)
+    )
+
+    chess.castling = castling
+
+    # --------------------------------------------------------
+    # EN PASSANT
+    # --------------------------------------------------------
+
+    ep_plane = states[:, 17].flip(1).reshape(
+        B, 64
+    ) > 0.5
+
+    ep_exists = ep_plane.any(dim=1)
+
+    ep_square = torch.full(
+        (B,),
+        -1,
+        dtype=torch.int16,
+        device=device
+    )
+
+    if ep_exists.any():
+
+        rows = torch.nonzero(
+            ep_exists,
+            as_tuple=False
+        ).flatten()
+
+        squares = torch.argmax(
+            ep_plane[rows].to(torch.int8),
+            dim=1
+        )
+
+        ep_square[rows] = squares.to(torch.int16)
+
+    chess.ep_square = ep_square
+
+    # --------------------------------------------------------
+    # CLOCKS
+    # --------------------------------------------------------
+
+    chess.halfmove_clock = torch.zeros(
+        (B,),
+        dtype=torch.int16,
+        device=device
+    )
+
+    chess.fullmove_number = torch.ones(
+        (B,),
+        dtype=torch.int16,
+        device=device
+    )
+
+    return chess
+
+
+print("\nReconstructing GPU chess positions...")
+
+root_states = replay_states_to_gpu_chess(
+    samples,
+    DEVICE
+)
+
+print("Reconstruction complete.")
+
+
+# ------------------------------------------------------------
+# VERIFY RECONSTRUCTION
+# ------------------------------------------------------------
+
+print("\nVerifying reconstructed states...")
+
+reconstructed_input = root_states.to_model_input()
+
+original_states = torch.from_numpy(
+    np.stack(
+        [np.asarray(s[0], dtype=np.float32) for s in samples]
+    )
+).to(DEVICE)
+
+max_difference = (
+    reconstructed_input - original_states
+).abs().max().item()
+
+mean_difference = (
+    reconstructed_input - original_states
+).abs().mean().item()
+
+print(f"Maximum state difference: {max_difference:.8f}")
+print(f"Mean state difference:    {mean_difference:.8f}")
+
+if max_difference > 1e-5:
+    print(
+        "\nWARNING: Reconstruction is not identical!"
+    )
+else:
+    print(
+        "State reconstruction verified."
     )
 
 
-# ============================================================
-# CONVERT TO TORCH
-# ============================================================
+# ------------------------------------------------------------
+# LEGAL MOVE MASK
+# ------------------------------------------------------------
 
-states = torch.from_numpy(
-    np.stack(states_np)
-).float().to(DEVICE)
+print("\nGenerating legal moves...")
 
-target_policy = torch.from_numpy(
-    np.stack(target_policies_np)
-).float().to(DEVICE)
+legal_mask = root_states.legal_move_mask()
 
-target_values = torch.tensor(
-    values_np,
-    dtype=torch.float32,
-    device=DEVICE,
-)
-
+legal_counts = legal_mask.sum(
+    dim=1
+).float()
 
 print(
-    f"\nState batch shape: "
-    f"{tuple(states.shape)}"
+    f"Average legal moves: "
+    f"{legal_counts.mean().item():.2f}"
 )
 
 print(
-    f"Target policy shape: "
-    f"{tuple(target_policy.shape)}"
+    f"Minimum legal moves: "
+    f"{legal_counts.min().item():.0f}"
 )
 
 print(
-    f"Target values shape: "
-    f"{tuple(target_values.shape)}"
+    f"Maximum legal moves: "
+    f"{legal_counts.max().item():.0f}"
 )
 
 
-# ============================================================
-# VERIFY STATE SHAPE
-# ============================================================
+# ------------------------------------------------------------
+# NETWORK POLICY
+# ------------------------------------------------------------
 
-if states.ndim != 4:
-
-    raise RuntimeError(
-        f"Expected states to have 4 dimensions "
-        f"[batch, channels, height, width]. "
-        f"Got {tuple(states.shape)}"
-    )
-
-
-print(
-    f"State channels: {states.shape[1]}"
-)
-
-print(
-    f"Board size: "
-    f"{states.shape[2]} x {states.shape[3]}"
-)
-
-
-# ============================================================
-# RAW NETWORK POLICY
-# ============================================================
-
-print("\n")
-print("=" * 70)
-print("RAW RL53 POLICY ON REAL REPLAY POSITIONS")
-print("=" * 70)
-
+print("\nRunning RL53 network...")
 
 with torch.inference_mode():
 
-    model_input = states
+    model_input = root_states.to_model_input()
 
     if DEVICE.type == "cuda":
-
         model_input = model_input.contiguous(
             memory_format=torch.channels_last
         )
 
         with torch.autocast(
             device_type="cuda",
-            dtype=torch.float16,
+            dtype=torch.float16
         ):
+            logits, values = model(model_input)
 
-            logits, values = model(
-                model_input
-            )
+    else:
+        logits, values = model(model_input)
+
+    logits = logits.float()
+    values = values.squeeze(-1).float()
+
+
+# ------------------------------------------------------------
+# MASK NETWORK POLICY TO TRUE LEGAL MOVES
+# ------------------------------------------------------------
+
+masked_logits = logits.masked_fill(
+    ~legal_mask,
+    torch.finfo(logits.dtype).min
+)
+
+network_policy = torch.softmax(
+    masked_logits,
+    dim=1
+)
+
+# Safety normalization.
+network_policy = network_policy * legal_mask.float()
+
+network_policy = network_policy / network_policy.sum(
+    dim=1,
+    keepdim=True
+).clamp_min(1e-12)
+
+
+# ------------------------------------------------------------
+# METRIC FUNCTIONS
+# ------------------------------------------------------------
+
+EPS = 1e-12
+
+
+def entropy(policy):
+    p = policy.clamp_min(EPS)
+
+    return -(
+        p * torch.log(p)
+    ).sum(dim=1)
+
+
+def normalized_entropy(policy, legal_counts):
+    h = entropy(policy)
+
+    return h / torch.log(
+        legal_counts.clamp_min(2)
+    )
+
+
+def max_probability(policy):
+    return policy.max(dim=1).values
+
+
+def kl_divergence(p, q):
+
+    p = p.clamp_min(EPS)
+    q = q.clamp_min(EPS)
+
+    return (
+        p * (torch.log(p) - torch.log(q))
+    ).sum(dim=1)
+
+
+def correlation(p, q):
+
+    p_mean = p.mean(dim=1, keepdim=True)
+    q_mean = q.mean(dim=1, keepdim=True)
+
+    p_centered = p - p_mean
+    q_centered = q - q_mean
+
+    numerator = (
+        p_centered * q_centered
+    ).sum(dim=1)
+
+    denominator = torch.sqrt(
+        (p_centered ** 2).sum(dim=1)
+        *
+        (q_centered ** 2).sum(dim=1)
+    ).clamp_min(EPS)
+
+    return numerator / denominator
+
+
+def rankdata_torch(x):
+
+    # Simple rank implementation.
+    order = torch.argsort(x, dim=1)
+
+    ranks = torch.zeros_like(
+        x,
+        dtype=torch.float32
+    )
+
+    rank_values = torch.arange(
+        x.shape[1],
+        device=x.device,
+        dtype=torch.float32
+    )
+
+    ranks.scatter_(
+        1,
+        order,
+        rank_values.unsqueeze(0).expand_as(x)
+    )
+
+    return ranks
+
+
+def spearman_correlation(p, q):
+
+    rp = rankdata_torch(p)
+    rq = rankdata_torch(q)
+
+    return correlation(rp, rq)
+
+
+def top1_agreement(p, q):
+
+    p_top = p.argmax(dim=1)
+    q_top = q.argmax(dim=1)
+
+    return (
+        p_top == q_top
+    ).float()
+
+
+# ------------------------------------------------------------
+# NETWORK BASELINE METRICS
+# ------------------------------------------------------------
+
+net_entropy = entropy(network_policy)
+net_norm_entropy = normalized_entropy(
+    network_policy,
+    legal_counts
+)
+net_max = max_probability(network_policy)
+
+print("\n" + "=" * 70)
+print("NETWORK BASELINE")
+print("=" * 70)
+
+print(
+    f"Entropy:              "
+    f"{net_entropy.mean().item():.4f}"
+)
+
+print(
+    f"Normalized entropy:   "
+    f"{net_norm_entropy.mean().item():.4f}"
+)
+
+print(
+    f"Max probability:      "
+    f"{net_max.mean().item():.4f}"
+)
+
+print(
+    f"Value mean:           "
+    f"{values.mean().item():.4f}"
+)
+
+print(
+    f"Value std:            "
+    f"{values.std().item():.4f}"
+)
+
+
+# ------------------------------------------------------------
+# HELPER: RUN MCTS
+# ------------------------------------------------------------
+
+def run_mcts(
+    root_states,
+    simulations
+):
+
+    print(
+        f"\nRunning MCTS: "
+        f"{simulations} simulations..."
+    )
+
+    search = GPUMCTS(
+        model=model,
+        device=DEVICE,
+        c_puct=1.5
+    )
+
+    start_event = None
+    end_event = None
+
+    if DEVICE.type == "cuda":
+
+        start_event = torch.cuda.Event(
+            enable_timing=True
+        )
+
+        end_event = torch.cuda.Event(
+            enable_timing=True
+        )
+
+        torch.cuda.synchronize()
+
+        start_event.record()
+
+    else:
+        import time
+        start_time = time.perf_counter()
+
+    # IMPORTANT:
+    # No Dirichlet noise.
+    search.search(
+        root_states,
+        num_simulations=simulations,
+        dirichlet_alpha=None,
+        dirichlet_epsilon=0.0,
+        batch_size=MCTS_BATCH_SIZE
+    )
+
+    if DEVICE.type == "cuda":
+
+        end_event.record()
+        torch.cuda.synchronize()
+
+        elapsed_ms = start_event.elapsed_time(
+            end_event
+        )
 
     else:
 
-        logits, values = model(
-            model_input
-        )
+        elapsed_ms = (
+            time.perf_counter() - start_time
+        ) * 1000.0
 
+    mcts_policy = search.root_visit_policy()
 
-# ============================================================
-# POLICY FROM NETWORK
-# ============================================================
-
-network_policy = torch.softmax(
-    logits.float(),
-    dim=1,
-)
-
-
-# ============================================================
-# IMPORTANT:
-# MASK ONLY ACTIONS THAT ARE ZERO IN THE STORED TARGET
-# ============================================================
-#
-# The replay target policy contains non-zero probability
-# only on legal moves that MCTS considered.
-#
-# Therefore we use its support as the legal-action mask.
-#
-# This avoids reconstructing GPUChess states.
-# ============================================================
-
-target_mask = target_policy > 0
-
-
-# ============================================================
-# NETWORK POLICY OVER TARGET'S LEGAL ACTIONS
-# ============================================================
-
-masked_logits = logits.float().masked_fill(
-    ~target_mask,
-    torch.finfo(torch.float32).min,
-)
-
-network_policy_legal = torch.softmax(
-    masked_logits,
-    dim=1,
-)
-
-
-# ============================================================
-# METRIC FUNCTION
-# ============================================================
-
-def calculate_metrics(
-    policy,
-    mask,
-):
-
-    safe_policy = policy.clamp_min(
-        1e-12
+    # Normalize again for safety.
+    mcts_policy = mcts_policy / (
+        mcts_policy.sum(
+            dim=1,
+            keepdim=True
+        ).clamp_min(EPS)
     )
 
-    entropy = -(
-        policy * safe_policy.log()
-    ).sum(dim=1)
-
-    num_actions = mask.sum(
-        dim=1
-    ).float()
-
-    normalized_entropy = (
-        entropy /
-        torch.log(
-            num_actions.clamp_min(2)
-        )
+    print(
+        f"Elapsed: {elapsed_ms / 1000:.2f}s"
     )
 
-    max_probability = policy.max(
-        dim=1
-    ).values
+    return mcts_policy, elapsed_ms
 
-    return {
-        "entropy":
-            entropy.mean().item(),
 
-        "normalized_entropy":
-            normalized_entropy.mean().item(),
+# ------------------------------------------------------------
+# STORE RESULTS
+# ------------------------------------------------------------
 
-        "max_probability":
-            max_probability.mean().item(),
+all_results = {}
 
-        "num_actions":
-            num_actions.mean().item(),
 
-        "entropy_each":
-            entropy,
+# ------------------------------------------------------------
+# RUN 100 / 200 / 400
+# ------------------------------------------------------------
 
-        "normalized_each":
-            normalized_entropy,
+for simulations in MCTS_SIMULATIONS:
 
-        "max_each":
-            max_probability,
+    mcts_policy, elapsed_ms = run_mcts(
+        root_states,
+        simulations
+    )
+
+    # --------------------------------------------------------
+    # Metrics
+    # --------------------------------------------------------
+
+    mcts_entropy = entropy(mcts_policy)
+
+    mcts_norm_entropy = normalized_entropy(
+        mcts_policy,
+        legal_counts
+    )
+
+    mcts_max = max_probability(
+        mcts_policy
+    )
+
+    kl_net_mcts = kl_divergence(
+        network_policy,
+        mcts_policy
+    )
+
+    kl_mcts_net = kl_divergence(
+        mcts_policy,
+        network_policy
+    )
+
+    pearson = correlation(
+        network_policy,
+        mcts_policy
+    )
+
+    spearman = spearman_correlation(
+        network_policy,
+        mcts_policy
+    )
+
+    top1 = top1_agreement(
+        network_policy,
+        mcts_policy
+    )
+
+    all_results[simulations] = {
+        "policy": mcts_policy.detach().clone(),
+        "entropy": mcts_entropy.detach().clone(),
+        "normalized_entropy": mcts_norm_entropy.detach().clone(),
+        "max_probability": mcts_max.detach().clone(),
+        "kl_net_mcts": kl_net_mcts.detach().clone(),
+        "kl_mcts_net": kl_mcts_net.detach().clone(),
+        "pearson": pearson.detach().clone(),
+        "spearman": spearman.detach().clone(),
+        "top1": top1.detach().clone(),
+        "elapsed_ms": elapsed_ms,
     }
 
+    print("\n" + "-" * 70)
+    print(f"MCTS = {simulations} SIMULATIONS")
+    print("-" * 70)
 
-# ============================================================
-# RAW NETWORK METRICS
-# ============================================================
-
-network_metrics = calculate_metrics(
-    network_policy_legal,
-    target_mask,
-)
-
-
-# ============================================================
-# TARGET POLICY METRICS
-# ============================================================
-
-target_metrics = calculate_metrics(
-    target_policy,
-    target_mask,
-)
-
-
-# ============================================================
-# PRINT NETWORK RESULTS
-# ============================================================
-
-print("\n")
-print("=" * 70)
-print("NETWORK POLICY")
-print("=" * 70)
-
-print(
-    f"Average target-supported actions: "
-    f"{network_metrics['num_actions']:.2f}"
-)
-
-print(
-    f"Entropy: "
-    f"{network_metrics['entropy']:.4f}"
-)
-
-print(
-    f"Normalized entropy: "
-    f"{network_metrics['normalized_entropy']:.4f}"
-)
-
-print(
-    f"Max probability: "
-    f"{network_metrics['max_probability']:.4f}"
-)
-
-
-# ============================================================
-# PRINT MCTS TARGET RESULTS
-# ============================================================
-
-print("\n")
-print("=" * 70)
-print("STORED MCTS TARGET POLICY")
-print("=" * 70)
-
-print(
-    f"Average actions: "
-    f"{target_metrics['num_actions']:.2f}"
-)
-
-print(
-    f"Entropy: "
-    f"{target_metrics['entropy']:.4f}"
-)
-
-print(
-    f"Normalized entropy: "
-    f"{target_metrics['normalized_entropy']:.4f}"
-)
-
-print(
-    f"Max probability: "
-    f"{target_metrics['max_probability']:.4f}"
-)
-
-
-# ============================================================
-# POLICY CROSS-ENTROPY
-# ============================================================
-
-target_safe = target_policy.clamp_min(
-    1e-12
-)
-
-network_log_probs = torch.log(
-    network_policy_legal.clamp_min(1e-12)
-)
-
-cross_entropy = -(
-    target_policy *
-    network_log_probs
-).sum(dim=1)
-
-
-print("\n")
-print("=" * 70)
-print("NETWORK vs MCTS TARGET")
-print("=" * 70)
-
-print(
-    f"Policy cross-entropy: "
-    f"{cross_entropy.mean().item():.4f}"
-)
-
-
-# ============================================================
-# KL DIVERGENCE
-# ============================================================
-
-kl_divergence = (
-    target_policy *
-    (
-        torch.log(
-            target_policy.clamp_min(1e-12)
-        )
-        -
-        torch.log(
-            network_policy_legal.clamp_min(1e-12)
-        )
+    print(
+        f"MCTS entropy:             "
+        f"{mcts_entropy.mean().item():.4f}"
     )
-).sum(dim=1)
+
+    print(
+        f"MCTS normalized entropy:  "
+        f"{mcts_norm_entropy.mean().item():.4f}"
+    )
+
+    print(
+        f"MCTS max probability:     "
+        f"{mcts_max.mean().item():.4f}"
+    )
+
+    print(
+        f"KL(Network || MCTS):      "
+        f"{kl_net_mcts.mean().item():.4f}"
+    )
+
+    print(
+        f"KL(MCTS || Network):      "
+        f"{kl_mcts_net.mean().item():.4f}"
+    )
+
+    print(
+        f"Pearson correlation:      "
+        f"{pearson.mean().item():.4f}"
+    )
+
+    print(
+        f"Spearman correlation:     "
+        f"{spearman.mean().item():.4f}"
+    )
+
+    print(
+        f"Top-1 agreement:           "
+        f"{top1.mean().item() * 100:.2f}%"
+    )
+
+    print(
+        f"Time:                     "
+        f"{elapsed_ms / 1000:.2f}s"
+    )
 
 
-print(
-    f"KL(target || network): "
-    f"{kl_divergence.mean().item():.4f}"
-)
+# ------------------------------------------------------------
+# POSITION-BY-POSITION RESULTS
+# ------------------------------------------------------------
 
-
-# ============================================================
-# VALUE COMPARISON
-# ============================================================
-
-network_values = values.squeeze(-1).float()
-
-value_mse = torch.mean(
-    (
-        network_values -
-        target_values
-    ) ** 2
-)
-
-print(
-    f"Value MSE: "
-    f"{value_mse.item():.4f}"
-)
-
-
-# ============================================================
-# POSITION-BY-POSITION
-# ============================================================
-
-print("\n")
-print("=" * 110)
+print("\n\n" + "=" * 70)
 print("POSITION-BY-POSITION RESULTS")
-print("=" * 110)
-
-print(
-    f"{'Pos':>5}"
-    f"{'Actions':>10}"
-    f"{'Net Ent':>12}"
-    f"{'Net Norm':>12}"
-    f"{'Net Max':>12}"
-    f"{'Target Ent':>13}"
-    f"{'Target Norm':>14}"
-    f"{'Target Max':>13}"
-)
-
-print("-" * 110)
+print("=" * 70)
 
 for i in range(NUM_POSITIONS):
 
     print(
-        f"{i + 1:>5}"
-        f"{int(network_metrics['num_actions'] if False else target_mask[i].sum().item()):>10}"
-        f"{network_metrics['entropy_each'][i].item():>12.4f}"
-        f"{network_metrics['normalized_each'][i].item():>12.4f}"
-        f"{network_metrics['max_each'][i].item():>12.4f}"
-        f"{target_metrics['entropy_each'][i].item():>13.4f}"
-        f"{target_metrics['normalized_each'][i].item():>14.4f}"
-        f"{target_metrics['max_each'][i].item():>13.4f}"
+        f"\nPosition {i + 1:02d} "
+        f"(replay index {indices[i]})"
     )
 
+    print(
+        f"Legal moves: "
+        f"{int(legal_counts[i].item())}"
+    )
 
-# ============================================================
-# TOP NETWORK vs TARGET MOVES
-# ============================================================
+    print(
+        f"Network entropy: "
+        f"{net_entropy[i].item():.4f}"
+    )
 
-print("\n")
+    print(
+        f"Network max: "
+        f"{net_max[i].item():.4f}"
+    )
+
+    for simulations in MCTS_SIMULATIONS:
+
+        r = all_results[simulations]
+
+        print(
+            f"  MCTS {simulations:3d}: "
+            f"entropy={r['entropy'][i].item():.4f}, "
+            f"max={r['max_probability'][i].item():.4f}, "
+            f"corr={r['pearson'][i].item():.4f}, "
+            f"KL(N||M)={r['kl_net_mcts'][i].item():.4f}, "
+            f"top1={bool(r['top1'][i].item())}"
+        )
+
+
+# ------------------------------------------------------------
+# TOP MOVES COMPARISON
+# ------------------------------------------------------------
+
+def print_top_moves(
+    position_idx,
+    policy,
+    name,
+    k=10
+):
+
+    p = policy[position_idx]
+
+    values, actions = torch.topk(
+        p,
+        k=min(k, int((p > 0).sum().item()))
+    )
+
+    print(f"\n{name}")
+
+    for rank, (action, prob) in enumerate(
+        zip(actions.tolist(), values.tolist()),
+        start=1
+    ):
+
+        print(
+            f"  {rank:2d}. "
+            f"action={action:4d} "
+            f"prob={prob:.6f}"
+        )
+
+
+# ------------------------------------------------------------
+# SHOW A FEW POSITIONS
+# ------------------------------------------------------------
+
+print("\n\n" + "=" * 70)
+print("TOP-MOVE COMPARISON")
 print("=" * 70)
-print("TOP NETWORK vs MCTS TARGET")
-print("=" * 70)
 
-
-for position in range(
+for position_idx in range(
     min(5, NUM_POSITIONS)
 ):
 
-    mask = target_mask[position]
-
-    legal_actions = torch.nonzero(
-        mask,
-        as_tuple=False,
-    ).flatten()
-
-    # --------------------------------------------------------
-    # Network probabilities
-    # --------------------------------------------------------
-
-    net_probs = network_policy_legal[
-        position,
-        legal_actions,
-    ]
-
-    net_top_k = min(
-        5,
-        legal_actions.numel(),
+    print(
+        "\n" + "#" * 70
     )
-
-    net_top_probs, net_indices = torch.topk(
-        net_probs,
-        k=net_top_k,
-    )
-
-    net_top_actions = legal_actions[
-        net_indices
-    ]
-
-    # --------------------------------------------------------
-    # Target probabilities
-    # --------------------------------------------------------
-
-    target_probs = target_policy[
-        position,
-        legal_actions,
-    ]
-
-    target_top_k = min(
-        5,
-        legal_actions.numel(),
-    )
-
-    target_top_probs, target_indices = torch.topk(
-        target_probs,
-        k=target_top_k,
-    )
-
-    target_top_actions = legal_actions[
-        target_indices
-    ]
 
     print(
-        f"\nPosition {position + 1}"
+        f"POSITION {position_idx + 1} "
+        f"(replay index {indices[position_idx]})"
     )
 
-    print("\n  NETWORK:")
+    print(
+        "#" * 70
+    )
 
-    for rank in range(net_top_k):
+    print_top_moves(
+        position_idx,
+        network_policy,
+        "RL53 NETWORK"
+    )
 
-        print(
-            f"    {rank + 1}. "
-            f"Action "
-            f"{net_top_actions[rank].item():4d} "
-            f"Prob "
-            f"{net_top_probs[rank].item():.4f}"
-        )
+    for simulations in MCTS_SIMULATIONS:
 
-    print("\n  MCTS TARGET:")
-
-    for rank in range(target_top_k):
-
-        print(
-            f"    {rank + 1}. "
-            f"Action "
-            f"{target_top_actions[rank].item():4d} "
-            f"Prob "
-            f"{target_top_probs[rank].item():.4f}"
+        print_top_moves(
+            position_idx,
+            all_results[simulations]["policy"],
+            f"MCTS {simulations}"
         )
 
 
-# ============================================================
-# SUMMARY
-# ============================================================
+# ------------------------------------------------------------
+# FINAL SUMMARY TABLE
+# ------------------------------------------------------------
 
-print("\n")
-print("=" * 70)
-print("SUMMARY")
+print("\n\n" + "=" * 70)
+print("FINAL SUMMARY")
 print("=" * 70)
 
 print(
-    f"""
-RL53 network:
-    Normalized entropy = "
-    {network_metrics['normalized_entropy']:.4f}
-
-    Max probability = "
-    {network_metrics['max_probability']:.4f}
-
-
-Stored MCTS targets:
-    Normalized entropy = "
-    {target_metrics['normalized_entropy']:.4f}
-
-    Max probability = "
-    {target_metrics['max_probability']:.4f}
-
-
-Network vs target:
-    Cross-entropy = "
-    {cross_entropy.mean().item():.4f}
-
-    KL(target || network) = "
-    {kl_divergence.mean().item():.4f}
-
-    Value MSE = "
-    {value_mse.item():.4f}
-"""
+    f"{'Sims':>6} "
+    f"{'Entropy':>10} "
+    f"{'NormEnt':>10} "
+    f"{'MaxProb':>10} "
+    f"{'KL N||M':>10} "
+    f"{'KL M||N':>10} "
+    f"{'Pearson':>10} "
+    f"{'Spearman':>10} "
+    f"{'Top1 %':>10}"
 )
 
+print("-" * 100)
+
+for simulations in MCTS_SIMULATIONS:
+
+    r = all_results[simulations]
+
+    print(
+        f"{simulations:>6} "
+        f"{r['entropy'].mean().item():>10.4f} "
+        f"{r['normalized_entropy'].mean().item():>10.4f} "
+        f"{r['max_probability'].mean().item():>10.4f} "
+        f"{r['kl_net_mcts'].mean().item():>10.4f} "
+        f"{r['kl_mcts_net'].mean().item():>10.4f} "
+        f"{r['pearson'].mean().item():>10.4f} "
+        f"{r['spearman'].mean().item():>10.4f} "
+        f"{r['top1'].mean().item()*100:>10.2f}"
+    )
+
+
+# ------------------------------------------------------------
+# NETWORK BASELINE
+# ------------------------------------------------------------
+
+print("-" * 100)
+
+print(
+    f"{'NET':>6} "
+    f"{net_entropy.mean().item():>10.4f} "
+    f"{net_norm_entropy.mean().item():>10.4f} "
+    f"{net_max.mean().item():>10.4f}"
+)
+
+
+# ------------------------------------------------------------
+# INTERPRETATION HELP
+# ------------------------------------------------------------
+
+print("\n\n" + "=" * 70)
+print("HOW TO READ THIS TEST")
 print("=" * 70)
+
+print("""
+The important numbers are:
+
+1. Pearson / Spearman
+   --------------------
+   HIGH correlation:
+       MCTS is mostly following the neural-network prior.
+
+   LOW correlation:
+       MCTS is substantially changing the policy.
+
+2. Top-1 agreement
+   ----------------
+   HIGH:
+       Network and MCTS usually select the same move.
+
+   LOW:
+       Search is frequently changing the preferred move.
+
+3. MCTS entropy vs Network entropy
+   --------------------------------
+   If MCTS entropy drops as simulations increase:
+
+       100 -> high entropy
+       200 -> lower entropy
+       400 -> lower entropy
+
+   then additional simulations are making the search more selective.
+
+4. MCTS max probability
+   ---------------------
+   If this increases:
+
+       100 -> 0.10
+       200 -> 0.15
+       400 -> 0.25
+
+   then additional simulations are concentrating visits.
+
+5. KL divergence
+   ---------------
+   Small KL:
+       MCTS is close to the network.
+
+   Large KL:
+       MCTS is substantially changing the policy.
+
+The most important comparison is:
+
+       NETWORK
+          vs
+       MCTS-100
+          vs
+       MCTS-200
+          vs
+       MCTS-400
+
+If MCTS-100 is extremely correlated with the network,
+while MCTS-400 becomes substantially different, then
+100 simulations may simply be too small for your current
+network.
+
+If even MCTS-400 remains extremely correlated with the
+network, then the search itself may not be extracting
+much additional information from the value network.
+""")
+
+
+print("\nDiagnostic finished.")
