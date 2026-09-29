@@ -1,811 +1,450 @@
 # ============================================================
-# RL53 SELF-PLAY INTEGRATION TEST - ROBUST ENTRYPOINT VERSION
-# ============================================================
-#
-# IMPORTANT:
-# Your Kaggle training/self_play.py is NOT the same revision as
-# the copied source we previously inspected. Therefore this test
-# does NOT assume that play_games() or _play_games_gpu() exists.
-#
-# It imports the ACTUAL training/self_play.py on Kaggle and detects
-# the available self-play entrypoint.
-#
-# Preferred order:
-#   1. play_games_multi_gpu
-#   2. _play_games_gpu
-#   3. play_games
-#
-# The test then validates the returned SelfPlayResult objects.
-#
+# FIND THE ACTUAL SELF-PLAY IMPLEMENTATION
 # ============================================================
 
 import os
 import sys
-import traceback
+import ast
 import inspect
-import numpy as np
-import torch
+import importlib
+from pathlib import Path
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-PROJECT_DIR = "/kaggle/working/chess-zero"
-
-CHECKPOINT_PATH = (
-    "/kaggle/working/chess-zero/checkpoints/rl_iteration_53.pt"
-)
-
-NUM_GAMES = 8
-NUM_SIMULATIONS = 100
-MAX_MOVES = 200
-
-TEMPERATURE = 1.0
-TEMPERATURE_MOVES = 60
-
-DIRICHLET_ALPHA = 0.3
-DIRICHLET_EPSILON = 0.25
-
-BATCH_SIZE = 128
-SEED = 42
-
-
-# ============================================================
-# HEADER
-# ============================================================
+PROJECT = Path("/kaggle/working/chess-zero")
 
 print("=" * 100)
-print("RL53 GPU SELF-PLAY INTEGRATION TEST")
+print("ACTUAL SELF-PLAY SOURCE DIAGNOSTIC")
 print("=" * 100)
 
 print()
-print("Project:", PROJECT_DIR)
-print("Checkpoint:", CHECKPOINT_PATH)
+print("PROJECT:", PROJECT)
 
-if torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-    print("Device:", DEVICE)
-    print("GPU:", torch.cuda.get_device_name(0))
-    print("CUDA:", torch.version.cuda)
+# ------------------------------------------------------------
+# 1. CHECK FILES
+# ------------------------------------------------------------
+
+print()
+print("=" * 100)
+print("1. SELF-PLAY RELATED FILES")
+print("=" * 100)
+
+for path in sorted(PROJECT.rglob("*.py")):
+    name = str(path.relative_to(PROJECT)).lower()
+
+    if (
+        "self_play" in name
+        or "rl_training" in name
+        or "iteration" in name
+        or "main.py" in name
+    ):
+        print(path.relative_to(PROJECT))
+
+
+# ------------------------------------------------------------
+# 2. READ ACTUAL training/self_play.py
+# ------------------------------------------------------------
+
+SELF_PLAY = PROJECT / "training" / "self_play.py"
+
+print()
+print("=" * 100)
+print("2. ACTUAL training/self_play.py")
+print("=" * 100)
+
+print("Exists:", SELF_PLAY.exists())
+
+if SELF_PLAY.exists():
+
+    text = SELF_PLAY.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    lines = text.splitlines()
+
+    print("Lines:", len(lines))
+    print("Bytes:", SELF_PLAY.stat().st_size)
+
+    print()
+    print("FIRST 80 LINES")
+    print("-" * 100)
+
+    for i, line in enumerate(lines[:80], start=1):
+        print(
+            f"{i:4d}: {line}"
+        )
+
+    print()
+    print("FUNCTIONS / CLASSES")
+    print("-" * 100)
+
+    try:
+
+        tree = ast.parse(text)
+
+        for node in tree.body:
+
+            if isinstance(
+                node,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                ),
+            ):
+
+                kind = (
+                    "CLASS"
+                    if isinstance(node, ast.ClassDef)
+                    else "FUNCTION"
+                )
+
+                print(
+                    f"{kind:8s} "
+                    f"{node.name:40s} "
+                    f"line={node.lineno}"
+                )
+
+    except Exception as e:
+
+        print(
+            "AST parse failed:",
+            repr(e)
+        )
+
 else:
-    DEVICE = torch.device("cpu")
-    print("Device:", DEVICE)
 
-print()
-print("Games:", NUM_GAMES)
-print("Simulations/game:", NUM_SIMULATIONS)
-print("Max moves:", MAX_MOVES)
-print("Temperature:", TEMPERATURE)
-print("Temperature moves:", TEMPERATURE_MOVES)
-print("Dirichlet alpha:", DIRICHLET_ALPHA)
-print("Dirichlet epsilon:", DIRICHLET_EPSILON)
-print("Batch size:", BATCH_SIZE)
-print("Seed:", SEED)
+    print(
+        "training/self_play.py DOES NOT EXIST"
+    )
 
 
-# ============================================================
-# PROJECT PATH
-# ============================================================
-
-if PROJECT_DIR not in sys.path:
-    sys.path.insert(0, PROJECT_DIR)
-
-
-# ============================================================
-# TEST 1
-# ENVIRONMENT
-# ============================================================
+# ------------------------------------------------------------
+# 3. SEARCH ALL PYTHON FILES FOR SELF-PLAY FUNCTIONS
+# ------------------------------------------------------------
 
 print()
 print("=" * 100)
-print("TEST 1: ENVIRONMENT")
+print("3. SEARCH ENTIRE PROJECT FOR SELF-PLAY FUNCTIONS")
 print("=" * 100)
 
-assert torch.cuda.is_available(), "CUDA is required for this test."
-
-assert os.path.isdir(
-    PROJECT_DIR
-), f"Project directory not found: {PROJECT_DIR}"
-
-assert os.path.isfile(
-    CHECKPOINT_PATH
-), f"Checkpoint not found: {CHECKPOINT_PATH}"
-
-print("PASS: CUDA available")
-print("PASS: Project directory exists")
-print("PASS: RL53 checkpoint exists")
-
-
-# ============================================================
-# TEST 2
-# LOAD THE ACTUAL self_play MODULE
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 2: ACTUAL training.self_play MODULE")
-print("=" * 100)
-
-# Import the module itself rather than importing a guessed function.
-import training.self_play as self_play
-
-print()
-print("Loaded module:")
-print(self_play.__file__)
-
-assert os.path.abspath(self_play.__file__) == os.path.abspath(
-    os.path.join(PROJECT_DIR, "training", "self_play.py")
-), (
-    "Python loaded a different self_play.py than the Kaggle project file."
-)
-
-print()
-print("Available self-play callables:")
-
-candidate_names = [
-    "play_games_multi_gpu",
-    "_play_games_gpu",
+keywords = [
+    "self_play",
+    "selfplay",
     "play_games",
+    "play_game",
+    "generate_self_play",
+    "SelfPlay",
 ]
 
-available = []
+matches = []
 
-for name in candidate_names:
-    obj = getattr(self_play, name, None)
+for path in PROJECT.rglob("*.py"):
 
-    if callable(obj):
-        available.append(name)
-
-        print()
-        print(f"FOUND: {name}")
-        try:
-            print(
-                inspect.signature(obj)
-            )
-        except Exception:
-            print("Signature unavailable.")
-    else:
-        print(f"NOT FOUND: {name}")
-
-
-print()
-
-assert available, (
-    "No supported self-play entrypoint exists in the actual "
-    "training/self_play.py. "
-    f"Available module names containing 'play': "
-    f"{[x for x in dir(self_play) if 'play' in x.lower()]}"
-)
-
-# Use the highest-level entrypoint available.
-#
-# play_games_multi_gpu is preferred because this is the function
-# used by the multi-GPU RL training pipeline.
-if "play_games_multi_gpu" in available:
-    ENTRYPOINT_NAME = "play_games_multi_gpu"
-    ENTRYPOINT = self_play.play_games_multi_gpu
-
-elif "_play_games_gpu" in available:
-    ENTRYPOINT_NAME = "_play_games_gpu"
-    ENTRYPOINT = self_play._play_games_gpu
-
-else:
-    ENTRYPOINT_NAME = "play_games"
-    ENTRYPOINT = self_play.play_games
-
-print(
-    "SELECTED ENTRYPOINT:",
-    ENTRYPOINT_NAME
-)
-
-
-# ============================================================
-# TEST 3
-# LOAD RL53 MODEL
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 3: LOAD RL53 MODEL")
-print("=" * 100)
-
-from model.chess_net import ChessNet
-
-checkpoint = torch.load(
-    CHECKPOINT_PATH,
-    map_location="cpu",
-    weights_only=False,
-)
-
-print()
-print("Checkpoint keys:")
-for key in checkpoint.keys():
-    print(" ", key)
-
-model = ChessNet().to(DEVICE)
-
-model.load_state_dict(
-    checkpoint["model_state_dict"]
-)
-
-model.eval()
-
-if DEVICE.type == "cuda":
-    model.to(memory_format=torch.channels_last)
-
-iteration = checkpoint.get("iteration", None)
-
-print()
-print("Checkpoint iteration:", iteration)
-
-if iteration is not None:
-    assert int(iteration) == 53, (
-        f"Expected RL53 checkpoint, got iteration {iteration}"
-    )
-
-print("PASS: RL53 model loaded")
-
-
-# ============================================================
-# TEST 4
-# RUN THE ACTUAL SELF-PLAY ENTRYPOINT
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 4: RUN ACTUAL SELF-PLAY")
-print("=" * 100)
-
-print()
-print("Using:", ENTRYPOINT_NAME)
-
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-
-
-try:
-
-    if ENTRYPOINT_NAME == "play_games_multi_gpu":
-
-        # This is the actual high-level multi-GPU function.
-        results = ENTRYPOINT(
-            model=model,
-            checkpoint_path=CHECKPOINT_PATH,
-            num_games=NUM_GAMES,
-            num_simulations=NUM_SIMULATIONS,
-            max_moves=MAX_MOVES,
-            temperature=TEMPERATURE,
-            temperature_moves=TEMPERATURE_MOVES,
-            dirichlet_alpha=DIRICHLET_ALPHA,
-            dirichlet_epsilon=DIRICHLET_EPSILON,
-            batch_size=BATCH_SIZE,
-            seed=SEED,
+    try:
+        text = path.read_text(
+            encoding="utf-8",
+            errors="replace",
         )
-
-    else:
-
-        # Direct GPU self-play fallback.
-        results = ENTRYPOINT(
-            model=model,
-            num_games=NUM_GAMES,
-            num_simulations=NUM_SIMULATIONS,
-            max_moves=MAX_MOVES,
-            temperature=TEMPERATURE,
-            temperature_moves=TEMPERATURE_MOVES,
-            dirichlet_alpha=DIRICHLET_ALPHA,
-            dirichlet_epsilon=DIRICHLET_EPSILON,
-            batch_size=BATCH_SIZE,
-        )
-
-except Exception:
-
-    print()
-    print("=" * 100)
-    print("SELF-PLAY FAILED")
-    print("=" * 100)
-
-    traceback.print_exc()
-
-    raise
-
-
-# ============================================================
-# TEST 5
-# BASIC RETURN VALIDATION
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 5: RETURN VALUE")
-print("=" * 100)
-
-assert isinstance(results, list), (
-    f"Expected list, got {type(results)}"
-)
-
-assert len(results) == NUM_GAMES, (
-    f"Expected {NUM_GAMES} games, got {len(results)}"
-)
-
-print(
-    f"PASS: returned {len(results)} games"
-)
-
-
-# ============================================================
-# TEST 6
-# GAME RESULT VALIDATION
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 6: GAME RESULT VALIDATION")
-print("=" * 100)
-
-VALID_TERMINATIONS = {
-    "CHECKMATE",
-    "STALEMATE",
-    "FIFTY_MOVE",
-    "INSUFFICIENT_MATERIAL",
-    "THREEFOLD_REPETITION",
-    "MAX_MOVES",
-    "UNKNOWN",
-}
-
-VALID_RESULTS = {
-    -1,
-    0,
-    1,
-    None,
-}
-
-completed_games = 0
-incomplete_games = 0
-total_samples = 0
-
-for i, result in enumerate(results):
-
-    game = i + 1
-
-    print()
-    print(
-        f"Game {game}:"
-    )
-    print(
-        f"  moves       = {result.moves_played}"
-    )
-    print(
-        f"  result      = {result.result}"
-    )
-    print(
-        f"  termination = {result.termination}"
-    )
-    print(
-        f"  completed   = {result.completed}"
-    )
-    print(
-        f"  samples     = {len(result.training_data)}"
-    )
-
-    assert result.termination in VALID_TERMINATIONS, (
-        f"Game {game}: invalid termination "
-        f"{result.termination}"
-    )
-
-    assert result.result in VALID_RESULTS, (
-        f"Game {game}: invalid result "
-        f"{result.result}"
-    )
-
-    assert int(result.moves_played) >= 0, (
-        f"Game {game}: negative move count"
-    )
-
-    if result.completed:
-
-        completed_games += 1
-
-        assert result.result in {-1, 0, 1}, (
-            f"Game {game}: completed game has invalid result"
-        )
-
-        assert result.termination != "MAX_MOVES", (
-            f"Game {game}: completed game marked MAX_MOVES"
-        )
-
-    else:
-
-        incomplete_games += 1
-
-        assert result.result is None, (
-            f"Game {game}: incomplete result should be None"
-        )
-
-        assert len(result.training_data) == 0, (
-            f"Game {game}: incomplete game contains training data"
-        )
-
-    total_samples += len(result.training_data)
-
-    print(
-        f"PASS: Game {game}"
-    )
-
-
-print()
-print("Completed games:", completed_games)
-print("Incomplete games:", incomplete_games)
-print("Total training samples:", total_samples)
-
-
-# ============================================================
-# TEST 7
-# SAMPLE COUNT
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 7: TRAINING SAMPLE COUNT")
-print("=" * 100)
-
-for i, result in enumerate(results):
-
-    game = i + 1
-
-    if not result.completed:
+    except Exception:
         continue
 
-    assert len(result.training_data) == result.moves_played, (
-        f"Game {game}: "
-        f"samples={len(result.training_data)} "
-        f"but moves={result.moves_played}"
-    )
+    lines = text.splitlines()
+
+    for lineno, line in enumerate(
+        lines,
+        start=1,
+    ):
+
+        lower = line.lower()
+
+        if any(
+            keyword.lower() in lower
+            for keyword in keywords
+        ):
+
+            matches.append(
+                (
+                    path.relative_to(PROJECT),
+                    lineno,
+                    line.strip(),
+                )
+            )
+
+
+for path, lineno, line in matches:
 
     print(
-        f"PASS: Game {game}: "
-        f"{len(result.training_data)} samples "
-        f"for {result.moves_played} moves"
+        f"{str(path):60s} "
+        f"line {lineno:5d}: "
+        f"{line}"
     )
 
+print()
+print(
+    "Total matching lines:",
+    len(matches)
+)
 
-# ============================================================
-# TEST 8
-# SAMPLE SHAPES / VALUES / POLICIES
-# ============================================================
+
+# ------------------------------------------------------------
+# 4. INSPECT ACTUAL IMPORTED MODULE
+# ------------------------------------------------------------
 
 print()
 print("=" * 100)
-print("TEST 8: TRAINING SAMPLE CONTENT")
+print("4. IMPORTED training.self_play MODULE")
 print("=" * 100)
 
-samples_checked = 0
+sys.path.insert(
+    0,
+    str(PROJECT)
+)
 
-for i, result in enumerate(results):
+import training.self_play as sp
 
-    game = i + 1
+print(
+    "Module:",
+    sp
+)
 
-    for j, sample in enumerate(result.training_data):
-
-        state, policy, value = sample
-
-        state = np.asarray(state)
-        policy = np.asarray(policy)
-
-        assert state.shape == (
-            18,
-            8,
-            8,
-        ), (
-            f"Game {game}, sample {j}: "
-            f"bad state shape {state.shape}"
-        )
-
-        assert policy.shape == (
-            4544,
-        ), (
-            f"Game {game}, sample {j}: "
-            f"bad policy shape {policy.shape}"
-        )
-
-        assert np.isfinite(state).all(), (
-            f"Game {game}, sample {j}: "
-            f"state contains NaN/Inf"
-        )
-
-        assert np.isfinite(policy).all(), (
-            f"Game {game}, sample {j}: "
-            f"policy contains NaN/Inf"
-        )
-
-        assert np.all(policy >= -1e-7), (
-            f"Game {game}, sample {j}: "
-            f"negative policy value"
-        )
-
-        policy_sum = float(policy.sum())
-
-        assert abs(policy_sum - 1.0) <= 1e-4, (
-            f"Game {game}, sample {j}: "
-            f"policy sum={policy_sum}"
-        )
-
-        assert int(np.count_nonzero(policy > 0.0)) > 0, (
-            f"Game {game}, sample {j}: "
-            f"policy has no nonzero actions"
-        )
-
-        assert float(value) in {
-            -1.0,
-            0.0,
-            1.0,
-        }, (
-            f"Game {game}, sample {j}: "
-            f"invalid value target {value}"
-        )
-
-        samples_checked += 1
-
-        if samples_checked <= 10:
-
-            print()
-            print(
-                f"Sample {samples_checked}"
-            )
-
-            print(
-                "  game:",
-                game
-            )
-
-            print(
-                "  sample:",
-                j
-            )
-
-            print(
-                "  state shape:",
-                state.shape
-            )
-
-            print(
-                "  state dtype:",
-                state.dtype
-            )
-
-            print(
-                "  state range:",
-                float(state.min()),
-                "to",
-                float(state.max())
-            )
-
-            print(
-                "  policy shape:",
-                policy.shape
-            )
-
-            print(
-                "  policy sum:",
-                policy_sum
-            )
-
-            print(
-                "  policy max:",
-                float(policy.max())
-            )
-
-            print(
-                "  policy nonzero:",
-                int(np.count_nonzero(policy > 0.0))
-            )
-
-            print(
-                "  value:",
-                value
-            )
-
-            print(
-                "PASS: sample"
-            )
-
-
-assert samples_checked > 0, (
-    "No training samples were generated."
+print(
+    "File:",
+    getattr(
+        sp,
+        "__file__",
+        None,
+    )
 )
 
 print()
-print(
-    "Total samples checked:",
-    samples_checked
-)
+print("ALL PUBLIC / PRIVATE NAMES:")
 
+names = [
+    x
+    for x in dir(sp)
+    if not x.startswith("__")
+]
 
-# ============================================================
-# TEST 9
-# GLOBAL DATA RANGE
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 9: GLOBAL DATA RANGE")
-print("=" * 100)
-
-state_min = float("inf")
-state_max = float("-inf")
-
-policy_min = float("inf")
-policy_max = float("-inf")
-
-values_seen = set()
-
-for result in results:
-
-    for state, policy, value in result.training_data:
-
-        state = np.asarray(state)
-        policy = np.asarray(policy)
-
-        state_min = min(
-            state_min,
-            float(state.min())
+for name in names:
+    try:
+        obj = getattr(
+            sp,
+            name,
         )
 
-        state_max = max(
-            state_max,
-            float(state.max())
+        if callable(obj):
+            print(
+                f"CALLABLE  {name}"
+            )
+        else:
+            print(
+                f"OBJECT    {name}"
+            )
+
+    except Exception:
+        print(
+            f"ERROR     {name}"
         )
 
-        policy_min = min(
-            policy_min,
-            float(policy.min())
+
+# ------------------------------------------------------------
+# 5. INSPECT ACTUAL rl_training.py
+# ------------------------------------------------------------
+
+RL_TRAINING = PROJECT / "training" / "rl_training.py"
+
+print()
+print("=" * 100)
+print("5. ACTUAL training/rl_training.py")
+print("=" * 100)
+
+print(
+    "Exists:",
+    RL_TRAINING.exists()
+)
+
+if RL_TRAINING.exists():
+
+    text = RL_TRAINING.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    lines = text.splitlines()
+
+    print(
+        "Lines:",
+        len(lines)
+    )
+
+    print()
+    print("SELF-PLAY RELATED LINES")
+    print("-" * 100)
+
+    found = False
+
+    for i, line in enumerate(
+        lines,
+        start=1,
+    ):
+
+        lower = line.lower()
+
+        if (
+            "self_play" in lower
+            or "selfplay" in lower
+            or "play_games" in lower
+            or "self play" in lower
+        ):
+
+            print(
+                f"{i:5d}: {line}"
+            )
+
+            found = True
+
+    if not found:
+        print(
+            "NO SELF-PLAY REFERENCES FOUND"
         )
 
-        policy_max = max(
-            policy_max,
-            float(policy.max())
+    print()
+    print("IMPORT LINES")
+    print("-" * 100)
+
+    for i, line in enumerate(
+        lines,
+        start=1,
+    ):
+
+        stripped = line.strip()
+
+        if (
+            stripped.startswith("import ")
+            or stripped.startswith("from ")
+        ):
+
+            print(
+                f"{i:5d}: {line}"
+            )
+
+
+# ------------------------------------------------------------
+# 6. SEARCH FOR CALLABLES IN rl_training AST
+# ------------------------------------------------------------
+
+print()
+print("=" * 100)
+print("6. FUNCTIONS / CLASSES IN rl_training.py")
+print("=" * 100)
+
+if RL_TRAINING.exists():
+
+    try:
+
+        text = RL_TRAINING.read_text(
+            encoding="utf-8",
+            errors="replace",
         )
 
-        values_seen.add(
-            float(value)
+        tree = ast.parse(text)
+
+        for node in tree.body:
+
+            if isinstance(
+                node,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                ),
+            ):
+
+                kind = (
+                    "CLASS"
+                    if isinstance(
+                        node,
+                        ast.ClassDef,
+                    )
+                    else "FUNCTION"
+                )
+
+                print(
+                    f"{kind:8s} "
+                    f"{node.name:50s} "
+                    f"line={node.lineno}"
+                )
+
+    except Exception as e:
+
+        print(
+            "AST error:",
+            repr(e)
         )
 
-print(
-    "State range:",
-    state_min,
-    "to",
-    state_max
-)
 
-print(
-    "Policy range:",
-    policy_min,
-    "to",
-    policy_max
-)
-
-print(
-    "Values seen:",
-    sorted(values_seen)
-)
-
-assert state_min >= -1e-6
-assert state_max <= 1.0 + 1e-6
-
-assert policy_min >= -1e-7
-assert policy_max <= 1.0 + 1e-6
-
-print("PASS: state range")
-print("PASS: policy range")
-
-
-# ============================================================
-# TEST 10
-# VALUE TARGET DISTRIBUTION
-# ============================================================
+# ------------------------------------------------------------
+# 7. SEARCH FOR ALL IMPORTS OF self_play
+# ------------------------------------------------------------
 
 print()
 print("=" * 100)
-print("TEST 10: VALUE TARGET DISTRIBUTION")
+print("7. ALL IMPORTS REFERENCING SELF-PLAY")
 print("=" * 100)
 
-value_counts = {
-    -1.0: 0,
-    0.0: 0,
-    1.0: 0,
-}
+for path in PROJECT.rglob("*.py"):
 
-for result in results:
+    try:
+        text = path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        continue
 
-    for _, _, value in result.training_data:
+    for i, line in enumerate(
+        text.splitlines(),
+        start=1,
+    ):
 
-        value_counts[
-            float(value)
-        ] += 1
+        lower = line.lower()
 
-print(
-    "Value -1:",
-    value_counts[-1.0]
-)
+        if (
+            "from training.self_play" in lower
+            or "import training.self_play" in lower
+            or "from .self_play" in lower
+            or "import self_play" in lower
+        ):
 
-print(
-    "Value  0:",
-    value_counts[0.0]
-)
-
-print(
-    "Value +1:",
-    value_counts[1.0]
-)
-
-assert sum(
-    value_counts.values()
-) == total_samples
-
-print(
-    "PASS: value counts match sample count"
-)
+            print(
+                f"{str(path.relative_to(PROJECT)):60s} "
+                f"line {i:5d}: "
+                f"{line.strip()}"
+            )
 
 
-# ============================================================
-# FINAL CUDA CHECK
-# ============================================================
+# ------------------------------------------------------------
+# FINAL
+# ------------------------------------------------------------
 
 print()
 print("=" * 100)
-print("FINAL CUDA CHECK")
-print("=" * 100)
-
-torch.cuda.synchronize()
-
-print(
-    "CUDA allocated:",
-    f"{torch.cuda.memory_allocated() / 1024**2:.2f} MB"
-)
-
-print(
-    "CUDA reserved:",
-    f"{torch.cuda.memory_reserved() / 1024**2:.2f} MB"
-)
-
-print(
-    "PASS: CUDA synchronized successfully"
-)
-
-
-# ============================================================
-# FINAL SUMMARY
-# ============================================================
-
-print()
-print("=" * 100)
-print("RL53 GPU SELF-PLAY INTEGRATION TEST PASSED")
+print("DIAGNOSTIC COMPLETE")
 print("=" * 100)
 
 print()
-print("Entrypoint:", ENTRYPOINT_NAME)
-print("Games:", NUM_GAMES)
-print("Completed:", completed_games)
-print("Incomplete:", incomplete_games)
-print("Training samples:", total_samples)
+print(
+    "Do NOT change any project files yet."
+)
 
-print()
-print("Verified:")
-print("  [PASS] Actual Kaggle training.self_play.py loaded")
-print("  [PASS] Correct self-play entrypoint detected")
-print("  [PASS] RL53 checkpoint")
-print("  [PASS] CUDA execution")
-print("  [PASS] Self-play execution")
-print("  [PASS] Game termination/result handling")
-print("  [PASS] Training sample count")
-print("  [PASS] State shape 18x8x8")
-print("  [PASS] Policy shape 4544")
-print("  [PASS] Policy normalization")
-print("  [PASS] Policy non-negativity")
-print("  [PASS] Value targets")
-print("  [PASS] NaN/Inf checks")
-print("  [PASS] Data ranges")
-print("  [PASS] CUDA synchronization")
+print(
+    "Send me the complete output."
+)
 
-print()
+print(
+    "We will identify the exact self-play function "
+    "from your actual Kaggle project before running "
+    "another MCTS test."
+)
+
 print("=" * 100)
