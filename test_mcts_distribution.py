@@ -1,41 +1,38 @@
 # ============================================================
-# RL53 MCTS CONVERGENCE DIAGNOSTIC
+# RL53 MCTS ROOT STATISTICS DIAGNOSTIC
 #
-# Purpose:
-#   Test whether MCTS converges as simulations increase.
+# PURPOSE
+# -------
+# Investigate WHY certain positions change substantially
+# between MCTS-100 / 200 / 400 / 800.
 #
-# Exact same RL53 replay-buffer positions are used for:
+# For the same exact replay positions, inspect:
 #
-#   MCTS-100
-#   MCTS-200
-#   MCTS-400
-#   MCTS-800
+#   P = neural-network prior
+#   N = visit count
+#   Q = backed-up value
+#   U = exploration term
+#   PUCT = -Q + U
 #
-# Dirichlet noise: OFF
+# Tested at:
 #
-# Main comparisons:
+#   100 simulations
+#   200 simulations
+#   400 simulations
+#   800 simulations
 #
-#   MCTS-100 vs MCTS-200
-#   MCTS-200 vs MCTS-400
-#   MCTS-400 vs MCTS-800
+# Dirichlet noise:
+#   OFF
 #
-# Metrics:
-#   - Entropy
-#   - Normalized entropy
-#   - Max visit probability
-#   - KL divergence
-#   - Symmetric KL
-#   - Pearson correlation
-#   - Spearman correlation
-#   - Top-1 agreement
-#   - Top-3 agreement
+# Positions:
+#   The 5 most unstable positions from the previous
+#   RL53 convergence diagnostic.
 #
 # ============================================================
 
 
 import os
 import sys
-import math
 import random
 import time
 
@@ -61,49 +58,109 @@ REPLAY_BUFFER = os.path.join(
     "replay_buffer_rl53.pt"
 )
 
-NUM_POSITIONS = 32
 
-# The important part of this diagnostic.
-MCTS_SIMULATIONS = [100, 200, 400, 800]
+# ------------------------------------------------------------
+# IMPORTANT:
+#
+# These are the exact replay indices corresponding to the
+# unstable positions from the previous diagnostic.
+# ------------------------------------------------------------
+
+TARGET_REPLAY_INDICES = [
+    147127,   # Previous Position 18
+    8331,     # Previous Position 11
+    110785,   # Previous Position 27
+    29184,    # Previous Position 01
+    56443,    # Previous Position 31
+]
+
+
+MCTS_SIMULATIONS = [
+    100,
+    200,
+    400,
+    800
+]
+
 
 MCTS_BATCH_SIZE = 16
 
-SEED = 42
+TOP_K = 10
+
+C_PUCT = 1.5
 
 DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
 )
 
 
-print("=" * 80)
-print("RL53 MCTS CONVERGENCE DIAGNOSTIC")
-print("=" * 80)
+# ============================================================
+# HEADER
+# ============================================================
 
-print(f"Project:       {PROJECT_ROOT}")
-print(f"Checkpoint:    {CHECKPOINT}")
-print(f"Replay:        {REPLAY_BUFFER}")
-print(f"Device:        {DEVICE}")
-print(f"Positions:     {NUM_POSITIONS}")
-print(f"MCTS tests:    {MCTS_SIMULATIONS}")
-print(f"Batch size:    {MCTS_BATCH_SIZE}")
-print("Dirichlet:     OFF")
-print("=" * 80)
+print("=" * 100)
+print("RL53 MCTS ROOT STATISTICS DIAGNOSTIC")
+print("=" * 100)
+
+print(
+    f"Project:       {PROJECT_ROOT}"
+)
+
+print(
+    f"Checkpoint:    {CHECKPOINT}"
+)
+
+print(
+    f"Replay:        {REPLAY_BUFFER}"
+)
+
+print(
+    f"Device:        {DEVICE}"
+)
+
+print(
+    f"Positions:     {len(TARGET_REPLAY_INDICES)}"
+)
+
+print(
+    f"MCTS tests:    {MCTS_SIMULATIONS}"
+)
+
+print(
+    f"Batch size:    {MCTS_BATCH_SIZE}"
+)
+
+print(
+    f"Top-K:         {TOP_K}"
+)
+
+print(
+    f"c_puct:        {C_PUCT}"
+)
+
+print(
+    "Dirichlet:     OFF"
+)
+
+print("=" * 100)
 
 
 # ============================================================
-# CUDA INFORMATION
+# CUDA
 # ============================================================
 
 if DEVICE.type == "cuda":
 
     print(
-        f"GPU:           "
-        f"{torch.cuda.get_device_name(0)}"
+        "GPU:",
+        torch.cuda.get_device_name(0)
     )
 
     print(
-        f"CUDA:          "
-        f"{torch.version.cuda}"
+        "CUDA:",
+        torch.version.cuda
     )
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -111,7 +168,9 @@ if DEVICE.type == "cuda":
 
 else:
 
-    print("WARNING: CUDA is not available.")
+    print(
+        "WARNING: CUDA is not available."
+    )
 
 
 torch.set_grad_enabled(False)
@@ -122,7 +181,11 @@ torch.set_grad_enabled(False)
 # ============================================================
 
 if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+
+    sys.path.insert(
+        0,
+        PROJECT_ROOT
+    )
 
 
 from model.chess_net import ChessNet
@@ -134,9 +197,9 @@ from mcts.gpu_mcts import GPUMCTS
 # LOAD MODEL
 # ============================================================
 
-print("\n" + "=" * 80)
+print("\n" + "=" * 100)
 print("LOADING RL53 MODEL")
-print("=" * 80)
+print("=" * 100)
 
 
 model = ChessNet().to(DEVICE)
@@ -156,25 +219,37 @@ print(
 
 
 # ------------------------------------------------------------
-# Handle checkpoint formats
+# Extract state dict
 # ------------------------------------------------------------
 
-if isinstance(checkpoint, dict):
+if isinstance(
+    checkpoint,
+    dict
+):
 
     if "model_state_dict" in checkpoint:
 
-        state_dict = checkpoint["model_state_dict"]
+        state_dict = (
+            checkpoint["model_state_dict"]
+        )
 
     elif "state_dict" in checkpoint:
 
-        state_dict = checkpoint["state_dict"]
+        state_dict = (
+            checkpoint["state_dict"]
+        )
 
     elif (
         "model" in checkpoint
-        and isinstance(checkpoint["model"], dict)
+        and isinstance(
+            checkpoint["model"],
+            dict
+        )
     ):
 
-        state_dict = checkpoint["model"]
+        state_dict = (
+            checkpoint["model"]
+        )
 
     else:
 
@@ -189,23 +264,29 @@ else:
 
 
 # ------------------------------------------------------------
-# Remove torch.compile prefix if present
+# Remove torch.compile prefix
 # ------------------------------------------------------------
 
 clean_state_dict = {}
 
 for key, value in state_dict.items():
 
-    if key.startswith("_orig_mod."):
+    if key.startswith(
+        "_orig_mod."
+    ):
 
-        key = key[len("_orig_mod."):]
+        key = key[
+            len("_orig_mod.") :
+        ]
 
     clean_state_dict[key] = value
 
 
-missing, unexpected = model.load_state_dict(
-    clean_state_dict,
-    strict=False
+missing, unexpected = (
+    model.load_state_dict(
+        clean_state_dict,
+        strict=False
+    )
 )
 
 
@@ -236,16 +317,19 @@ if unexpected:
 
 model.eval()
 
-print("\nRL53 model loaded successfully.")
+
+print(
+    "\nRL53 model loaded successfully."
+)
 
 
 # ============================================================
-# LOAD REPLAY BUFFER
+# LOAD REPLAY
 # ============================================================
 
-print("\n" + "=" * 80)
+print("\n" + "=" * 100)
 print("LOADING RL53 REPLAY BUFFER")
-print("=" * 80)
+print("=" * 100)
 
 
 replay = torch.load(
@@ -256,7 +340,7 @@ replay = torch.load(
 
 
 print(
-    "Replay object type:",
+    "Replay type:",
     type(replay)
 )
 
@@ -266,76 +350,44 @@ print(
 )
 
 
-if len(replay) < NUM_POSITIONS:
+# ------------------------------------------------------------
+# Verify requested indices
+# ------------------------------------------------------------
 
-    raise RuntimeError(
-        f"Replay buffer only contains "
-        f"{len(replay)} samples."
+for idx in TARGET_REPLAY_INDICES:
+
+    if idx < 0 or idx >= len(replay):
+
+        raise IndexError(
+            f"Replay index {idx} "
+            f"is outside replay buffer."
+        )
+
+
+# ============================================================
+# SELECT EXACT POSITIONS
+# ============================================================
+
+samples = [
+    replay[idx]
+    for idx in TARGET_REPLAY_INDICES
+]
+
+
+print("\nSelected positions:")
+
+for i, idx in enumerate(
+    TARGET_REPLAY_INDICES
+):
+
+    print(
+        f"  Position {i + 1}: "
+        f"replay index {idx}"
     )
 
 
 # ============================================================
-# INSPECT SAMPLE
-# ============================================================
-
-sample0 = replay[0]
-
-print("\nSample structure:")
-print("Type:", type(sample0))
-print("Length:", len(sample0))
-
-
-for i, x in enumerate(sample0):
-
-    if hasattr(x, "shape"):
-
-        print(
-            f"[{i}] "
-            f"shape={x.shape}, "
-            f"dtype={x.dtype}"
-        )
-
-    else:
-
-        print(
-            f"[{i}] "
-            f"type={type(x)}, "
-            f"value={x}"
-        )
-
-
-# ============================================================
-# REPRODUCIBLE SAMPLING
-# ============================================================
-
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
-
-if DEVICE.type == "cuda":
-
-    torch.cuda.manual_seed_all(SEED)
-
-
-indices = random.sample(
-    range(len(replay)),
-    NUM_POSITIONS
-)
-
-
-samples = [
-    replay[i]
-    for i in indices
-]
-
-
-print("\nSelected replay positions:")
-print(indices)
-
-
-# ============================================================
-# REPLAY STATE -> GPUChess
+# RECONSTRUCT GPUChess
 # ============================================================
 
 def replay_states_to_gpu_chess(
@@ -346,10 +398,10 @@ def replay_states_to_gpu_chess(
     states_np = np.stack(
         [
             np.asarray(
-                s[0],
+                sample[0],
                 dtype=np.float32
             )
-            for s in samples
+            for sample in samples
         ],
         axis=0
     )
@@ -389,25 +441,15 @@ def replay_states_to_gpu_chess(
     # PIECE PLANES
     # ========================================================
 
-    #
-    # Stored neural-network representation:
-    #
-    #   [18, 8, 8]
-    #
-    # GPUChess:
-    #
-    #   square = rank * 8 + file
-    #
-    # Model representation has vertically flipped
-    # board coordinates, therefore flip row dimension.
-    #
-
-    board_planes = states[
-        :, :12
-    ].flip(2)
+    board_planes = (
+        states[:, :12]
+        .flip(2)
+    )
 
 
-    square_bits = chess.square_bits
+    square_bits = (
+        chess.square_bits
+    )
 
 
     pieces = torch.zeros(
@@ -417,32 +459,39 @@ def replay_states_to_gpu_chess(
     )
 
 
-    for p in range(12):
+    for piece_type in range(12):
 
         occupancy = (
-            board_planes[:, p]
+            board_planes[
+                :,
+                piece_type
+            ]
             .reshape(B, 64)
             > 0.5
         )
 
 
-        bb = torch.zeros(
+        bitboard = torch.zeros(
             (B,),
             dtype=torch.int64,
             device=device
         )
 
 
-        for sq in range(64):
+        for square in range(64):
 
-            bb = torch.where(
-                occupancy[:, sq],
-                bb | square_bits[sq],
-                bb
+            bitboard = torch.where(
+                occupancy[:, square],
+                bitboard
+                | square_bits[square],
+                bitboard
             )
 
 
-        pieces[:, p] = bb
+        pieces[
+            :,
+            piece_type
+        ] = bitboard
 
 
     chess.pieces = pieces
@@ -458,17 +507,13 @@ def replay_states_to_gpu_chess(
     )
 
 
-    # GPUChess:
-    #
-    #   False = white
-    #   True  = black
-    #
-
-    chess.turn = ~white_to_move
+    chess.turn = (
+        ~white_to_move
+    )
 
 
     # ========================================================
-    # CASTLING RIGHTS
+    # CASTLING
     # ========================================================
 
     castling = torch.zeros(
@@ -486,11 +531,13 @@ def replay_states_to_gpu_chess(
 
     castling |= torch.where(
         states[:, 13, 0, 0] > 0.5,
+
         torch.tensor(
             WK,
             dtype=torch.int16,
             device=device
         ),
+
         torch.tensor(
             0,
             dtype=torch.int16,
@@ -501,11 +548,13 @@ def replay_states_to_gpu_chess(
 
     castling |= torch.where(
         states[:, 14, 0, 0] > 0.5,
+
         torch.tensor(
             WQ,
             dtype=torch.int16,
             device=device
         ),
+
         torch.tensor(
             0,
             dtype=torch.int16,
@@ -516,11 +565,13 @@ def replay_states_to_gpu_chess(
 
     castling |= torch.where(
         states[:, 15, 0, 0] > 0.5,
+
         torch.tensor(
             BK,
             dtype=torch.int16,
             device=device
         ),
+
         torch.tensor(
             0,
             dtype=torch.int16,
@@ -531,11 +582,13 @@ def replay_states_to_gpu_chess(
 
     castling |= torch.where(
         states[:, 16, 0, 0] > 0.5,
+
         torch.tensor(
             BQ,
             dtype=torch.int16,
             device=device
         ),
+
         torch.tensor(
             0,
             dtype=torch.int16,
@@ -572,7 +625,7 @@ def replay_states_to_gpu_chess(
     )
 
 
-    if ep_exists.any():
+    if bool(ep_exists.any()):
 
         rows = torch.nonzero(
             ep_exists,
@@ -581,13 +634,17 @@ def replay_states_to_gpu_chess(
 
 
         squares = torch.argmax(
-            ep_plane[rows].to(torch.int8),
+            ep_plane[rows].to(
+                torch.int8
+            ),
             dim=1
         )
 
 
         ep_square[rows] = (
-            squares.to(torch.int16)
+            squares.to(
+                torch.int16
+            )
         )
 
 
@@ -598,19 +655,21 @@ def replay_states_to_gpu_chess(
     # CLOCKS
     # ========================================================
 
-    # Replay states don't contain these.
-
-    chess.halfmove_clock = torch.zeros(
-        (B,),
-        dtype=torch.int16,
-        device=device
+    chess.halfmove_clock = (
+        torch.zeros(
+            (B,),
+            dtype=torch.int16,
+            device=device
+        )
     )
 
 
-    chess.fullmove_number = torch.ones(
-        (B,),
-        dtype=torch.int16,
-        device=device
+    chess.fullmove_number = (
+        torch.ones(
+            (B,),
+            dtype=torch.int16,
+            device=device
+        )
     )
 
 
@@ -618,76 +677,81 @@ def replay_states_to_gpu_chess(
 
 
 # ============================================================
-# RECONSTRUCT POSITIONS
+# BUILD POSITIONS
 # ============================================================
 
-print("\n" + "=" * 80)
-print("RECONSTRUCTING GPU CHESS POSITIONS")
-print("=" * 80)
+print("\n" + "=" * 100)
+print("RECONSTRUCTING POSITIONS")
+print("=" * 100)
 
 
-root_states = replay_states_to_gpu_chess(
-    samples,
-    DEVICE
+root_states = (
+    replay_states_to_gpu_chess(
+        samples,
+        DEVICE
+    )
 )
 
 
-print("Reconstruction complete.")
+print(
+    "Reconstruction complete."
+)
 
 
 # ============================================================
-# VERIFY RECONSTRUCTION
+# VERIFY EXACT STATE
 # ============================================================
 
-print("\nVerifying reconstruction...")
+print(
+    "\nVerifying state reconstruction..."
+)
 
 
-reconstructed_input = (
+reconstructed = (
     root_states.to_model_input()
 )
 
 
-original_states = torch.from_numpy(
+original = torch.from_numpy(
     np.stack(
         [
             np.asarray(
-                s[0],
+                sample[0],
                 dtype=np.float32
             )
-            for s in samples
+            for sample in samples
         ]
     )
 ).to(DEVICE)
 
 
-max_difference = (
-    reconstructed_input
-    - original_states
+max_diff = (
+    reconstructed
+    - original
 ).abs().max().item()
 
 
-mean_difference = (
-    reconstructed_input
-    - original_states
+mean_diff = (
+    reconstructed
+    - original
 ).abs().mean().item()
 
 
 print(
-    f"Maximum state difference: "
-    f"{max_difference:.10f}"
+    f"Maximum difference: "
+    f"{max_diff:.10f}"
 )
 
 print(
-    f"Mean state difference:    "
-    f"{mean_difference:.10f}"
+    f"Mean difference:    "
+    f"{mean_diff:.10f}"
 )
 
 
-if max_difference > 1e-5:
+if max_diff > 1e-5:
 
     raise RuntimeError(
-        "State reconstruction is NOT identical. "
-        "Do not continue."
+        "State reconstruction failed."
     )
 
 
@@ -697,10 +761,12 @@ print(
 
 
 # ============================================================
-# LEGAL MOVES
+# LEGAL MOVE MASK
 # ============================================================
 
-print("\nGenerating legal moves...")
+print(
+    "\nGenerating legal moves..."
+)
 
 
 legal_mask = (
@@ -711,279 +777,405 @@ legal_mask = (
 legal_counts = (
     legal_mask
     .sum(dim=1)
+)
+
+
+for i in range(
+    len(TARGET_REPLAY_INDICES)
+):
+
+    print(
+        f"Position {i + 1}: "
+        f"{int(legal_counts[i].item())} "
+        f"legal moves"
+    )
+
+
+# ============================================================
+# NETWORK ROOT EVALUATION
+# ============================================================
+
+print("\n" + "=" * 100)
+print("NETWORK ROOT EVALUATION")
+print("=" * 100)
+
+
+with torch.inference_mode():
+
+    model_input = (
+        root_states.to_model_input()
+    )
+
+
+    if DEVICE.type == "cuda":
+
+        model_input = (
+            model_input.contiguous(
+                memory_format=torch.channels_last
+            )
+        )
+
+
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16
+        ):
+
+            network_logits, network_values = (
+                model(model_input)
+            )
+
+    else:
+
+        network_logits, network_values = (
+            model(model_input)
+        )
+
+
+network_logits = (
+    network_logits.float()
+)
+
+network_values = (
+    network_values
+    .squeeze(-1)
     .float()
 )
 
 
-print(
-    f"Average legal moves: "
-    f"{legal_counts.mean().item():.2f}"
-)
+# ------------------------------------------------------------
+# Mask to legal moves
+# ------------------------------------------------------------
 
-print(
-    f"Minimum legal moves: "
-    f"{legal_counts.min().item():.0f}"
-)
-
-print(
-    f"Maximum legal moves: "
-    f"{legal_counts.max().item():.0f}"
-)
-
-
-# ============================================================
-# METRIC FUNCTIONS
-# ============================================================
-
-EPS = 1e-12
-
-
-def entropy(policy):
-
-    p = policy.clamp_min(EPS)
-
-    return -(
-        p * torch.log(p)
-    ).sum(dim=1)
-
-
-def normalized_entropy(
-    policy,
-    legal_counts
-):
-
-    h = entropy(policy)
-
-    denominator = torch.log(
-        legal_counts.clamp_min(2)
+masked_logits = (
+    network_logits.masked_fill(
+        ~legal_mask,
+        torch.finfo(
+            network_logits.dtype
+        ).min
     )
+)
 
-    return h / denominator
 
-
-def max_probability(policy):
-
-    return policy.max(
+network_policy = (
+    torch.softmax(
+        masked_logits,
         dim=1
-    ).values
+    )
+)
 
 
-def kl_divergence(
-    p,
-    q
+network_policy = (
+    network_policy
+    * legal_mask.float()
+)
+
+
+network_policy = (
+    network_policy
+    /
+    network_policy.sum(
+        dim=1,
+        keepdim=True
+    ).clamp_min(1e-12)
+)
+
+
+for i in range(
+    len(TARGET_REPLAY_INDICES)
 ):
 
-    p = p.clamp_min(EPS)
-    q = q.clamp_min(EPS)
+    print(
+        f"\nPosition {i + 1}"
+    )
 
-    return (
-        p * (
-            torch.log(p)
-            - torch.log(q)
+    print(
+        f"Replay index: "
+        f"{TARGET_REPLAY_INDICES[i]}"
+    )
+
+    print(
+        f"Network value: "
+        f"{network_values[i].item():+.6f}"
+    )
+
+
+# ============================================================
+# MCTS ROOT STAT EXTRACTION
+# ============================================================
+
+def extract_root_statistics(
+    search,
+    position_idx,
+    top_k=10
+):
+
+    """
+    Extract root-child statistics directly from the
+    GPUMCTS internal tree.
+
+    Returns:
+
+        action
+        prior P
+        visits N
+        Q
+        U
+        PUCT
+    """
+
+
+    # --------------------------------------------------------
+    # Root IDs
+    # --------------------------------------------------------
+
+    roots = search._root_ids
+
+
+    root_id = (
+        roots[position_idx]
+        .item()
+    )
+
+
+    # --------------------------------------------------------
+    # Root edge range
+    # --------------------------------------------------------
+
+    start = int(
+        search.edge_start[
+            root_id
+        ].item()
+    )
+
+
+    count = int(
+        search.edge_count[
+            root_id
+        ].item()
+    )
+
+
+    if count <= 0:
+
+        return []
+
+
+    edge_ids = torch.arange(
+        start,
+        start + count,
+        device=DEVICE,
+        dtype=torch.long
+    )
+
+
+    # --------------------------------------------------------
+    # Child nodes
+    # --------------------------------------------------------
+
+    child_nodes = (
+        search.edge_child[
+            edge_ids
+        ]
+        .to(torch.long)
+    )
+
+
+    # --------------------------------------------------------
+    # Action
+    # --------------------------------------------------------
+
+    actions = (
+        search.edge_action[
+            edge_ids
+        ]
+        .to(torch.long)
+    )
+
+
+    # --------------------------------------------------------
+    # Prior P
+    # --------------------------------------------------------
+
+    priors = (
+        search.edge_prior[
+            edge_ids
+        ]
+        .float()
+    )
+
+
+    # --------------------------------------------------------
+    # Visit count N
+    # --------------------------------------------------------
+
+    visits = (
+        search.visit_count[
+            child_nodes
+        ]
+        .float()
+    )
+
+
+    # --------------------------------------------------------
+    # Value sum
+    # --------------------------------------------------------
+
+    value_sum = (
+        search.value_sum[
+            child_nodes
+        ]
+        .float()
+    )
+
+
+    # --------------------------------------------------------
+    # Q value
+    #
+    # Q = value_sum / visits
+    # --------------------------------------------------------
+
+    q_values = torch.where(
+        visits > 0,
+        value_sum / visits,
+        torch.zeros_like(
+            value_sum
         )
-    ).sum(dim=1)
-
-
-def symmetric_kl(
-    p,
-    q
-):
-
-    return (
-        kl_divergence(p, q)
-        + kl_divergence(q, p)
-    ) * 0.5
-
-
-def correlation(
-    p,
-    q
-):
-
-    p_mean = p.mean(
-        dim=1,
-        keepdim=True
-    )
-
-    q_mean = q.mean(
-        dim=1,
-        keepdim=True
     )
 
 
-    p_centered = (
-        p - p_mean
-    )
+    # --------------------------------------------------------
+    # Parent visit count
+    # --------------------------------------------------------
 
-    q_centered = (
-        q - q_mean
-    )
-
-
-    numerator = (
-        p_centered
-        * q_centered
-    ).sum(dim=1)
-
-
-    denominator = torch.sqrt(
-        (
-            p_centered ** 2
-        ).sum(dim=1)
-        *
-        (
-            q_centered ** 2
-        ).sum(dim=1)
-    ).clamp_min(EPS)
-
-
-    return (
-        numerator
-        / denominator
+    parent_visits = (
+        search.visit_count[
+            root_id
+        ]
+        .float()
+        .clamp_min(1.0)
     )
 
 
-def rankdata_torch(x):
+    # --------------------------------------------------------
+    # Exploration term U
+    #
+    # U =
+    # c_puct * P * sqrt(N_parent) / (1 + N_child)
+    # --------------------------------------------------------
+
+    exploration = (
+        C_PUCT
+        * priors
+        * torch.sqrt(
+            parent_visits
+        )
+        /
+        (1.0 + visits)
+    )
+
+
+    # --------------------------------------------------------
+    # PUCT score
+    #
+    # Matches the search implementation:
+    #
+    # score = -Q + U
+    # --------------------------------------------------------
+
+    puct_scores = (
+        -q_values
+        + exploration
+    )
+
+
+    # --------------------------------------------------------
+    # Sort by visit count
+    # --------------------------------------------------------
 
     order = torch.argsort(
-        x,
-        dim=1
+        visits,
+        descending=True
     )
 
 
-    ranks = torch.zeros_like(
-        x,
-        dtype=torch.float32
-    )
-
-
-    rank_values = torch.arange(
-        x.shape[1],
-        device=x.device,
-        dtype=torch.float32
-    )
-
-
-    ranks.scatter_(
-        1,
-        order,
-        rank_values.unsqueeze(0)
-        .expand_as(x)
-    )
-
-
-    return ranks
-
-
-def spearman_correlation(
-    p,
-    q
-):
-
-    rp = rankdata_torch(p)
-    rq = rankdata_torch(q)
-
-    return correlation(
-        rp,
-        rq
-    )
-
-
-def top1_agreement(
-    p,
-    q
-):
-
-    return (
-        p.argmax(dim=1)
-        ==
-        q.argmax(dim=1)
-    ).float()
-
-
-def top3_agreement(
-    p,
-    q
-):
-
-    p_top3 = torch.topk(
-        p,
-        k=3,
-        dim=1
-    ).indices
-
-
-    q_top3 = torch.topk(
-        q,
-        k=3,
-        dim=1
-    ).indices
+    order = order[
+        :min(
+            top_k,
+            count
+        )
+    ]
 
 
     results = []
 
 
-    for i in range(
-        p.shape[0]
-    ):
+    for j in order.tolist():
 
-        a = set(
-            p_top3[i].tolist()
-        )
+        results.append({
 
-        b = set(
-            q_top3[i].tolist()
-        )
+            "action":
+                int(
+                    actions[j].item()
+                ),
 
-        results.append(
-            len(a.intersection(b))
-            / 3.0
-        )
+            "prior":
+                float(
+                    priors[j].item()
+                ),
+
+            "visits":
+                int(
+                    visits[j].item()
+                ),
+
+            "q":
+                float(
+                    q_values[j].item()
+                ),
+
+            "u":
+                float(
+                    exploration[j].item()
+                ),
+
+            "puct":
+                float(
+                    puct_scores[j].item()
+                )
+        })
 
 
-    return torch.tensor(
-        results,
-        device=p.device,
-        dtype=torch.float32
-    )
+    return results
 
 
 # ============================================================
 # RUN MCTS
 # ============================================================
 
-def run_mcts(
-    root_states,
-    simulations
+all_searches = {}
+
+all_stats = {}
+
+
+for simulations in (
+    MCTS_SIMULATIONS
 ):
 
-    print("\n" + "=" * 80)
+    print("\n\n" + "=" * 100)
+
     print(
-        f"RUNNING MCTS — "
-        f"{simulations} SIMULATIONS"
+        f"RUNNING MCTS "
+        f"WITH {simulations} SIMULATIONS"
     )
-    print("=" * 80)
 
+    print("=" * 100)
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Create a fresh MCTS tree for EVERY simulation count.
-    #
-    # This guarantees that:
-    #
-    # MCTS-100
-    # MCTS-200
-    # MCTS-400
-    # MCTS-800
-    #
-    # are independent searches from exactly the same roots.
-    # --------------------------------------------------------
 
     search = GPUMCTS(
         model=model,
         device=DEVICE,
-        c_puct=1.5
+        c_puct=C_PUCT
     )
 
 
@@ -1006,10 +1198,6 @@ def run_mcts(
 
         start_time = time.perf_counter()
 
-
-    # --------------------------------------------------------
-    # NO DIRICHLET NOISE
-    # --------------------------------------------------------
 
     with torch.inference_mode():
 
@@ -1042,720 +1230,615 @@ def run_mcts(
         ) * 1000.0
 
 
-    policy = (
-        search.root_visit_policy()
-        .float()
-    )
+    all_searches[
+        simulations
+    ] = search
 
 
-    # Safety normalization.
-
-    policy = (
-        policy
-        / policy.sum(
-            dim=1,
-            keepdim=True
-        ).clamp_min(EPS)
-    )
+    all_stats[
+        simulations
+    ] = {}
 
 
     print(
-        f"Elapsed time: "
+        f"Elapsed: "
         f"{elapsed_ms / 1000:.2f}s"
     )
 
 
-    return (
-        policy.detach().clone(),
-        elapsed_ms
-    )
+    # --------------------------------------------------------
+    # Extract root statistics
+    # --------------------------------------------------------
+
+    for position_idx in range(
+        len(TARGET_REPLAY_INDICES)
+    ):
+
+        stats = (
+            extract_root_statistics(
+                search,
+                position_idx,
+                TOP_K
+            )
+        )
+
+
+        all_stats[
+            simulations
+        ][position_idx] = stats
 
 
 # ============================================================
-# RUN ALL SEARCH DEPTHS
+# PRINT ROOT STATISTICS
 # ============================================================
 
-all_results = {}
-
-
-for simulations in MCTS_SIMULATIONS:
-
-    policy, elapsed_ms = run_mcts(
-        root_states,
-        simulations
-    )
-
-
-    all_results[simulations] = {
-
-        "policy":
-            policy,
-
-        "elapsed_ms":
-            elapsed_ms,
-
-        "entropy":
-            entropy(policy),
-
-        "normalized_entropy":
-            normalized_entropy(
-                policy,
-                legal_counts
-            ),
-
-        "max_probability":
-            max_probability(policy)
-    }
-
-
-    print(
-        f"\nMCTS-{simulations} summary:"
-    )
-
-    print(
-        f"  Entropy:       "
-        f"{all_results[simulations]['entropy'].mean().item():.4f}"
-    )
-
-    print(
-        f"  Norm entropy:  "
-        f"{all_results[simulations]['normalized_entropy'].mean().item():.4f}"
-    )
-
-    print(
-        f"  Max probability:"
-        f" {all_results[simulations]['max_probability'].mean().item():.4f}"
-    )
-
-
-# ============================================================
-# COMPARE ADJACENT SEARCH DEPTHS
-# ============================================================
-
-print("\n\n" + "=" * 80)
-print("MCTS CONVERGENCE — ADJACENT DEPTH COMPARISON")
-print("=" * 80)
-
-
-for a, b in zip(
-    MCTS_SIMULATIONS[:-1],
-    MCTS_SIMULATIONS[1:]
+for position_idx, replay_idx in enumerate(
+    TARGET_REPLAY_INDICES
 ):
 
-    p = all_results[a]["policy"]
-    q = all_results[b]["policy"]
-
-
-    kl_pq = kl_divergence(
-        p,
-        q
-    )
-
-    kl_qp = kl_divergence(
-        q,
-        p
-    )
-
-    skl = symmetric_kl(
-        p,
-        q
-    )
-
-    pearson = correlation(
-        p,
-        q
-    )
-
-    spearman = spearman_correlation(
-        p,
-        q
-    )
-
-    top1 = top1_agreement(
-        p,
-        q
-    )
-
-    top3 = top3_agreement(
-        p,
-        q
-    )
-
-
-    print("\n" + "-" * 80)
+    print("\n\n" + "#" * 100)
 
     print(
-        f"MCTS-{a}  vs  MCTS-{b}"
-    )
-
-    print("-" * 80)
-
-    print(
-        f"KL({a} || {b}):        "
-        f"{kl_pq.mean().item():.6f}"
+        f"POSITION {position_idx + 1}"
     )
 
     print(
-        f"KL({b} || {a}):        "
-        f"{kl_qp.mean().item():.6f}"
-    )
-
-    print(
-        f"Symmetric KL:          "
-        f"{skl.mean().item():.6f}"
-    )
-
-    print(
-        f"Pearson:               "
-        f"{pearson.mean().item():.6f}"
-    )
-
-    print(
-        f"Spearman:              "
-        f"{spearman.mean().item():.6f}"
-    )
-
-    print(
-        f"Top-1 agreement:       "
-        f"{top1.mean().item() * 100:.2f}%"
-    )
-
-    print(
-        f"Top-3 overlap:         "
-        f"{top3.mean().item() * 100:.2f}%"
-    )
-
-
-    # Store comparison.
-
-    all_results[
-        f"{a}_vs_{b}"
-    ] = {
-
-        "kl_pq":
-            kl_pq.detach().clone(),
-
-        "kl_qp":
-            kl_qp.detach().clone(),
-
-        "symmetric_kl":
-            skl.detach().clone(),
-
-        "pearson":
-            pearson.detach().clone(),
-
-        "spearman":
-            spearman.detach().clone(),
-
-        "top1":
-            top1.detach().clone(),
-
-        "top3":
-            top3.detach().clone()
-    }
-
-
-# ============================================================
-# COMPARE 100 vs 800 DIRECTLY
-# ============================================================
-
-print("\n\n" + "=" * 80)
-print("MCTS-100 vs MCTS-800")
-print("=" * 80)
-
-
-policy100 = all_results[100]["policy"]
-policy800 = all_results[800]["policy"]
-
-
-kl_100_800 = kl_divergence(
-    policy100,
-    policy800
-)
-
-kl_800_100 = kl_divergence(
-    policy800,
-    policy100
-)
-
-sym_100_800 = symmetric_kl(
-    policy100,
-    policy800
-)
-
-corr_100_800 = correlation(
-    policy100,
-    policy800
-)
-
-spear_100_800 = spearman_correlation(
-    policy100,
-    policy800
-)
-
-top1_100_800 = top1_agreement(
-    policy100,
-    policy800
-)
-
-top3_100_800 = top3_agreement(
-    policy100,
-    policy800
-)
-
-
-print(
-    f"KL(100 || 800):       "
-    f"{kl_100_800.mean().item():.6f}"
-)
-
-print(
-    f"KL(800 || 100):       "
-    f"{kl_800_100.mean().item():.6f}"
-)
-
-print(
-    f"Symmetric KL:         "
-    f"{sym_100_800.mean().item():.6f}"
-)
-
-print(
-    f"Pearson:              "
-    f"{corr_100_800.mean().item():.6f}"
-)
-
-print(
-    f"Spearman:             "
-    f"{spear_100_800.mean().item():.6f}"
-)
-
-print(
-    f"Top-1 agreement:      "
-    f"{top1_100_800.mean().item() * 100:.2f}%"
-)
-
-print(
-    f"Top-3 overlap:        "
-    f"{top3_100_800.mean().item() * 100:.2f}%"
-)
-
-
-# ============================================================
-# POSITION-BY-POSITION CONVERGENCE
-# ============================================================
-
-print("\n\n" + "=" * 80)
-print("POSITION-BY-POSITION CONVERGENCE")
-print("=" * 80)
-
-
-for i in range(NUM_POSITIONS):
-
-    print(
-        f"\nPosition {i + 1:02d} "
-        f"(replay index {indices[i]})"
+        f"Replay index: {replay_idx}"
     )
 
     print(
         f"Legal moves: "
-        f"{int(legal_counts[i].item())}"
+        f"{int(legal_counts[position_idx].item())}"
     )
 
+    print(
+        f"Network value: "
+        f"{network_values[position_idx].item():+.6f}"
+    )
 
-    for a, b in zip(
-        MCTS_SIMULATIONS[:-1],
-        MCTS_SIMULATIONS[1:]
+    print("#" * 100)
+
+
+    for simulations in (
+        MCTS_SIMULATIONS
     ):
 
-        comparison = all_results[
-            f"{a}_vs_{b}"
-        ]
+        search = (
+            all_searches[
+                simulations
+            ]
+        )
+
+
+        stats = (
+            all_stats[
+                simulations
+            ][position_idx]
+        )
+
+
+        root_id = (
+            search._root_ids[
+                position_idx
+            ]
+            .item()
+        )
+
+
+        root_visits = int(
+            search.visit_count[
+                root_id
+            ].item()
+        )
+
+
+        root_value_sum = float(
+            search.value_sum[
+                root_id
+            ].item()
+        )
+
+
+        root_q = (
+            root_value_sum
+            / root_visits
+            if root_visits > 0
+            else 0.0
+        )
 
 
         print(
-            f"  {a:3d} -> {b:3d}: "
-            f"symKL="
-            f"{comparison['symmetric_kl'][i].item():.4f}, "
-            f"corr="
-            f"{comparison['pearson'][i].item():.4f}, "
-            f"top1="
-            f"{bool(comparison['top1'][i].item())}"
+            "\n"
+            + "-" * 100
+        )
+
+        print(
+            f"MCTS-{simulations}"
+        )
+
+        print(
+            f"Root visits: "
+            f"{root_visits}"
+        )
+
+        print(
+            f"Root value sum: "
+            f"{root_value_sum:+.6f}"
+        )
+
+        print(
+            f"Root Q: "
+            f"{root_q:+.6f}"
+        )
+
+
+        print(
+            "\n"
+            "Rank | Action | Prior P | "
+            "Visits N | Q value | "
+            "U | PUCT"
+        )
+
+        print(
+            "-" * 100
+        )
+
+
+        for rank, item in enumerate(
+            stats,
+            start=1
+        ):
+
+            print(
+                f"{rank:4d} | "
+                f"{item['action']:6d} | "
+                f"{item['prior']:.6f} | "
+                f"{item['visits']:8d} | "
+                f"{item['q']:+.6f} | "
+                f"{item['u']:.6f} | "
+                f"{item['puct']:+.6f}"
+            )
+
+
+# ============================================================
+# CROSS-DEPTH MOVE TRACKING
+# ============================================================
+
+print("\n\n" + "=" * 100)
+print("CROSS-DEPTH MOVE TRACKING")
+print("=" * 100)
+
+
+for position_idx, replay_idx in enumerate(
+    TARGET_REPLAY_INDICES
+):
+
+    print(
+        "\n"
+        + "#" * 100
+    )
+
+    print(
+        f"POSITION {position_idx + 1} "
+        f"(replay {replay_idx})"
+    )
+
+    print(
+        "#" * 100
+    )
+
+
+    # Collect all actions appearing in
+    # top-K at any search depth.
+
+    action_set = set()
+
+
+    for simulations in (
+        MCTS_SIMULATIONS
+    ):
+
+        for item in all_stats[
+            simulations
+        ][position_idx]:
+
+            action_set.add(
+                item["action"]
+            )
+
+
+    # --------------------------------------------------------
+    # Print each important action across depths
+    # --------------------------------------------------------
+
+    for action in sorted(
+        action_set
+    ):
+
+        print(
+            "\nAction:",
+            action
+        )
+
+
+        for simulations in (
+            MCTS_SIMULATIONS
+        ):
+
+            stats = (
+                all_stats[
+                    simulations
+                ][position_idx]
+            )
+
+
+            found = None
+
+
+            for item in stats:
+
+                if (
+                    item["action"]
+                    == action
+                ):
+
+                    found = item
+                    break
+
+
+            if found is None:
+
+                print(
+                    f"  {simulations:3d}: "
+                    f"not top-{TOP_K}"
+                )
+
+            else:
+
+                print(
+                    f"  {simulations:3d}: "
+                    f"N={found['visits']:4d}, "
+                    f"P={found['prior']:.4f}, "
+                    f"Q={found['q']:+.4f}, "
+                    f"U={found['u']:.4f}, "
+                    f"PUCT={found['puct']:+.4f}"
+                )
+
+
+# ============================================================
+# TOP-1 TRACKING
+# ============================================================
+
+print("\n\n" + "=" * 100)
+print("TOP-1 MOVE TRACKING")
+print("=" * 100)
+
+
+for position_idx, replay_idx in enumerate(
+    TARGET_REPLAY_INDICES
+):
+
+    print(
+        f"\nPosition {position_idx + 1} "
+        f"(replay {replay_idx})"
+    )
+
+
+    for simulations in (
+        MCTS_SIMULATIONS
+    ):
+
+        stats = (
+            all_stats[
+                simulations
+            ][position_idx]
+        )
+
+
+        if not stats:
+
+            print(
+                f"  {simulations}: "
+                f"NO ROOT CHILDREN"
+            )
+
+            continue
+
+
+        top = stats[0]
+
+
+        print(
+            f"  {simulations:3d}: "
+            f"action={top['action']:4d}, "
+            f"N={top['visits']:4d}, "
+            f"P={top['prior']:.5f}, "
+            f"Q={top['q']:+.5f}, "
+            f"U={top['u']:.5f}, "
+            f"PUCT={top['puct']:+.5f}"
         )
 
 
 # ============================================================
-# FIND MOST UNSTABLE POSITIONS
+# TOP-1 CHANGES
 # ============================================================
 
-print("\n\n" + "=" * 80)
-print("MOST UNSTABLE POSITIONS")
-print("=" * 80)
+print("\n\n" + "=" * 100)
+print("TOP-1 CHANGES")
+print("=" * 100)
 
 
-comparison_400_800 = all_results[
-    "400_vs_800"
-]
-
-
-sym_kl_400_800 = (
-    comparison_400_800[
-        "symmetric_kl"
-    ]
-)
-
-
-sorted_indices = torch.argsort(
-    sym_kl_400_800,
-    descending=True
-)
-
-
-print(
-    "\nLargest MCTS-400 -> MCTS-800 changes:"
-)
-
-
-for rank in range(
-    min(10, NUM_POSITIONS)
+for position_idx, replay_idx in enumerate(
+    TARGET_REPLAY_INDICES
 ):
 
-    i = sorted_indices[
-        rank
-    ].item()
+    top_actions = []
 
 
-    print(
-        f"{rank + 1:2d}. "
-        f"Position {i + 1:02d} "
-        f"(replay {indices[i]}): "
-        f"symKL="
-        f"{sym_kl_400_800[i].item():.6f}, "
-        f"Pearson="
-        f"{comparison_400_800['pearson'][i].item():.4f}, "
-        f"Top1="
-        f"{bool(comparison_400_800['top1'][i].item())}"
-    )
-
-
-# ============================================================
-# TOP MOVES
-# ============================================================
-
-def print_top_moves(
-    position_idx,
-    policy,
-    name,
-    k=10
-):
-
-    p = policy[position_idx]
-
-
-    positive_count = int(
-        (p > 0).sum().item()
-    )
-
-
-    k = min(
-        k,
-        positive_count
-    )
-
-
-    values, actions = torch.topk(
-        p,
-        k=k
-    )
-
-
-    print(
-        f"\n{name}"
-    )
-
-
-    for rank, (
-        action,
-        probability
-    ) in enumerate(
-        zip(
-            actions.tolist(),
-            values.tolist()
-        ),
-        start=1
+    for simulations in (
+        MCTS_SIMULATIONS
     ):
 
-        print(
-            f"  {rank:2d}. "
-            f"action={action:4d} "
-            f"prob={probability:.6f}"
+        stats = (
+            all_stats[
+                simulations
+            ][position_idx]
         )
 
 
-# ============================================================
-# SHOW TOP MOVES FOR MOST UNSTABLE POSITIONS
-# ============================================================
+        if stats:
 
-print("\n\n" + "=" * 80)
-print("TOP MOVES FOR MOST UNSTABLE POSITIONS")
-print("=" * 80)
+            top_actions.append(
+                stats[0]["action"]
+            )
+
+        else:
+
+            top_actions.append(
+                None
+            )
 
 
-for rank in range(
-    min(5, NUM_POSITIONS)
-):
-
-    position_idx = (
-        sorted_indices[rank].item()
+    print(
+        f"\nPosition {position_idx + 1} "
+        f"(replay {replay_idx})"
     )
 
 
     print(
-        "\n" + "#" * 80
+        f"  100: {top_actions[0]}"
     )
 
     print(
-        f"POSITION {position_idx + 1:02d} "
-        f"(replay index {indices[position_idx]})"
+        f"  200: {top_actions[1]}"
     )
 
     print(
-        "#" * 80
+        f"  400: {top_actions[2]}"
     )
 
-
-    print_top_moves(
-        position_idx,
-        all_results[100]["policy"],
-        "MCTS-100"
-    )
-
-
-    print_top_moves(
-        position_idx,
-        all_results[200]["policy"],
-        "MCTS-200"
-    )
-
-
-    print_top_moves(
-        position_idx,
-        all_results[400]["policy"],
-        "MCTS-400"
-    )
-
-
-    print_top_moves(
-        position_idx,
-        all_results[800]["policy"],
-        "MCTS-800"
+    print(
+        f"  800: {top_actions[3]}"
     )
 
 
 # ============================================================
-# FINAL SUMMARY
+# ROOT VALUE COMPARISON
 # ============================================================
 
 print("\n\n" + "=" * 100)
-print("FINAL MCTS CONVERGENCE SUMMARY")
+print("ROOT VALUE COMPARISON")
 print("=" * 100)
 
 
 print(
-    f"{'Sims':>8} "
-    f"{'Entropy':>12} "
-    f"{'NormEnt':>12} "
-    f"{'MaxProb':>12} "
-    f"{'Time(s)':>12}"
+    f"{'Position':>10} "
+    f"{'Replay':>10} "
+    f"{'Network':>12} "
+    f"{'MCTS100':>12} "
+    f"{'MCTS200':>12} "
+    f"{'MCTS400':>12} "
+    f"{'MCTS800':>12}"
 )
 
-print("-" * 65)
-
-
-for simulations in MCTS_SIMULATIONS:
-
-    r = all_results[
-        simulations
-    ]
-
-
-    print(
-        f"{simulations:>8} "
-        f"{r['entropy'].mean().item():>12.4f} "
-        f"{r['normalized_entropy'].mean().item():>12.4f} "
-        f"{r['max_probability'].mean().item():>12.4f} "
-        f"{r['elapsed_ms'] / 1000:>12.2f}"
-    )
-
-
-# ============================================================
-# ADJACENT CONVERGENCE SUMMARY
-# ============================================================
-
-print("\n\n" + "=" * 100)
-print("ADJACENT MCTS CONVERGENCE")
-print("=" * 100)
-
-
-print(
-    f"{'Comparison':>18} "
-    f"{'SymKL':>12} "
-    f"{'Pearson':>12} "
-    f"{'Spearman':>12} "
-    f"{'Top1 %':>12} "
-    f"{'Top3 %':>12}"
-)
 
 print("-" * 90)
 
 
-for a, b in zip(
-    MCTS_SIMULATIONS[:-1],
-    MCTS_SIMULATIONS[1:]
+for position_idx, replay_idx in enumerate(
+    TARGET_REPLAY_INDICES
 ):
 
-    r = all_results[
-        f"{a}_vs_{b}"
-    ]
+    values = []
+
+
+    for simulations in (
+        MCTS_SIMULATIONS
+    ):
+
+        search = (
+            all_searches[
+                simulations
+            ]
+        )
+
+
+        root_id = (
+            search._root_ids[
+                position_idx
+            ]
+            .item()
+        )
+
+
+        visits = float(
+            search.visit_count[
+                root_id
+            ].item()
+        )
+
+
+        value_sum = float(
+            search.value_sum[
+                root_id
+            ].item()
+        )
+
+
+        root_q = (
+            value_sum / visits
+            if visits > 0
+            else 0.0
+        )
+
+
+        values.append(
+            root_q
+        )
 
 
     print(
-        f"{a:>7} -> {b:<7} "
-        f"{r['symmetric_kl'].mean().item():>12.6f} "
-        f"{r['pearson'].mean().item():>12.6f} "
-        f"{r['spearman'].mean().item():>12.6f} "
-        f"{r['top1'].mean().item() * 100:>12.2f} "
-        f"{r['top3'].mean().item() * 100:>12.2f}"
+        f"{position_idx + 1:>10} "
+        f"{replay_idx:>10} "
+        f"{network_values[position_idx].item():>+12.5f} "
+        f"{values[0]:>+12.5f} "
+        f"{values[1]:>+12.5f} "
+        f"{values[2]:>+12.5f} "
+        f"{values[3]:>+12.5f}"
     )
 
 
 # ============================================================
-# DIRECT 100 -> 800
+# FINAL DIAGNOSTIC GUIDE
 # ============================================================
 
 print("\n\n" + "=" * 100)
-print("DIRECT MCTS-100 -> MCTS-800")
-print("=" * 100)
-
-
-print(
-    f"Symmetric KL:    "
-    f"{sym_100_800.mean().item():.6f}"
-)
-
-print(
-    f"Pearson:         "
-    f"{corr_100_800.mean().item():.6f}"
-)
-
-print(
-    f"Spearman:        "
-    f"{spear_100_800.mean().item():.6f}"
-)
-
-print(
-    f"Top-1 agreement: "
-    f"{top1_100_800.mean().item() * 100:.2f}%"
-)
-
-print(
-    f"Top-3 overlap:   "
-    f"{top3_100_800.mean().item() * 100:.2f}%"
-)
-
-
-# ============================================================
-# INTERPRETATION GUIDE
-# ============================================================
-
-print("\n\n" + "=" * 100)
-print("HOW TO INTERPRET THE RESULT")
+print("WHAT WE ARE LOOKING FOR")
 print("=" * 100)
 
 
 print(
 """
-The MOST IMPORTANT comparison is:
+For each unstable position, inspect:
 
-    MCTS-100 -> MCTS-200
-    MCTS-200 -> MCTS-400
-    MCTS-400 -> MCTS-800
-
-
-If the search is converging, you should generally see:
-
-    Symmetric KL       decreasing
-    Pearson            increasing
-    Spearman           increasing
-    Top-1 agreement    increasing
-
-
-For example, a pattern like:
-
-    100 -> 200    large change
-    200 -> 400    smaller change
-    400 -> 800    very small change
-
-would indicate that MCTS is approaching a stable policy.
-
-
-If instead you see:
-
-    100 -> 200    large change
-    200 -> 400    large change
-    400 -> 800    large change
-
-then the search is NOT obviously converging.
-
-In that case, we should investigate:
-
-    - value estimates
-    - PUCT behavior
-    - visit allocation
-    - search backup
-    - leaf evaluation
-    - tree expansion
+    Prior P
+    Visits N
+    Q
+    U
+    PUCT
 
 
 IMPORTANT:
 
-Do NOT change RL54 yet.
+PUCT in this implementation is:
 
-Do NOT change replay-buffer size yet.
-
-Do NOT change the loss yet.
-
-Do NOT automatically increase self-play simulations yet.
-
-First determine whether the search itself converges.
+    PUCT = -Q + c_puct * P * sqrt(N_parent) / (1 + N_child)
 
 
-The most useful numbers to send back are:
+So:
 
-    100 -> 200:
-        SymKL
-        Pearson
-        Top1 %
+    P       = neural network prior
+    Q       = backed-up value estimate
+    U       = exploration pressure
+    N       = search visits
 
-    200 -> 400:
-        SymKL
-        Pearson
-        Top1 %
 
-    400 -> 800:
-        SymKL
-        Pearson
-        Top1 %
+------------------------------------------------------------
+CASE 1 — HEALTHY SEARCH
+------------------------------------------------------------
 
-and:
+A move may start with:
 
-    MCTS-100 -> MCTS-800:
-        SymKL
-        Pearson
-        Top1 %
+    high P
+    low N
+
+and then gain visits because its Q value looks good.
+
+As simulations increase, its N should generally become
+more concentrated if the search is finding something useful.
+
+
+------------------------------------------------------------
+CASE 2 — VALUE-DRIVEN RE-RANKING
+------------------------------------------------------------
+
+If:
+
+    P is relatively low
+    but Q becomes substantially better
+
+and that move gains many visits,
+
+then MCTS is using the value network to override the
+policy prior.
+
+That is potentially useful search behavior.
+
+
+------------------------------------------------------------
+CASE 3 — VALUE INSTABILITY
+------------------------------------------------------------
+
+If the same move's Q changes dramatically:
+
+    MCTS-100
+    MCTS-200
+    MCTS-400
+    MCTS-800
+
+and this causes the top move to change,
+
+then we need to investigate the value estimates.
+
+
+------------------------------------------------------------
+CASE 4 — PRIOR / PUCT DOMINATION
+------------------------------------------------------------
+
+If Q values are very similar between moves but one move
+continually wins because of P and U,
+
+then the behavior is more strongly driven by the policy
+prior and exploration term.
+
+
+------------------------------------------------------------
+CASE 5 — SEARCH INSTABILITY
+------------------------------------------------------------
+
+If:
+
+    Q values oscillate
+    top move changes
+    visit distribution changes strongly
+    and the same position does not settle by 800
+
+then we should inspect:
+
+    - value network
+    - backup signs
+    - PUCT implementation
+    - terminal handling
+    - tree expansion
+    - repeated-state handling
+
+
+DO NOT CHANGE RL54 YET.
+
+This test is specifically intended to tell us WHICH PART
+of the search is responsible for the instability.
 """
 )
 
 
-print("\n" + "=" * 80)
-print("DIAGNOSTIC FINISHED")
-print("=" * 80)
+print(
+    "\n" + "=" * 100
+)
+
+print(
+    "RL53 ROOT STATISTICS DIAGNOSTIC FINISHED"
+)
+
+print(
+    "=" * 100
+)
