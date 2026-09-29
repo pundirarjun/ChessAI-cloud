@@ -291,8 +291,8 @@ print(
 )
 
 assert_true(
-    best_expected_node == child_c,
-    "Manual PUCT prefers the highest exploration candidate",
+    best_child == child_b,
+    "Manual PUCT selects the highest PUCT score"
 )
 
 
