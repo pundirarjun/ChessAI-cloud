@@ -37,12 +37,7 @@ print("=" * 70)
 print(f"Device: {DEVICE}")
 print(f"Checkpoint: {CHECKPOINT}")
 
-model = ChessNet(
-    input_channels=18,
-    hidden_channels=128,
-    num_res_blocks=8,
-    policy_size=4544,
-).to(DEVICE)
+model = ChessNet().to(DEVICE)
 
 checkpoint = torch.load(
     CHECKPOINT,
