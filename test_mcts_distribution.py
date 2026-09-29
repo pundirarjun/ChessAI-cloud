@@ -1,192 +1,75 @@
 # ============================================================
-# RL53 MCTS ROOT STATISTICS DIAGNOSTIC
+# RL53 DEEP MCTS CHILD-VALUE / BACKUP DIAGNOSTIC
+# ============================================================
 #
-# PURPOSE
-# -------
-# Investigate WHY certain positions change substantially
-# between MCTS-100 / 200 / 400 / 800.
+# Purpose:
+#   Trace unstable root moves into their child positions and
+#   inspect:
 #
-# For the same exact replay positions, inspect:
+#       Root state
+#          |
+#          +--> selected action
+#                    |
+#                    +--> child state
+#                           |
+#                           +--> NN value
+#                           +--> legal moves
+#                           +--> terminal status
+#                           +--> MCTS value
 #
-#   P = neural-network prior
-#   N = visit count
-#   Q = backed-up value
-#   U = exploration term
-#   PUCT = -Q + U
-#
-# Tested at:
-#
-#   100 simulations
-#   200 simulations
-#   400 simulations
-#   800 simulations
-#
-# Dirichlet noise:
-#   OFF
-#
-# Positions:
-#   The 5 most unstable positions from the previous
-#   RL53 convergence diagnostic.
+# This does NOT train anything.
 #
 # ============================================================
-
 
 import os
 import sys
-import random
 import time
+import math
+import random
+import traceback
 
-import numpy as np
 import torch
+import torch.nn.functional as F
 
-
-# ============================================================
+# ------------------------------------------------------------
 # CONFIG
-# ============================================================
-
-PROJECT_ROOT = "/kaggle/working/chess-zero"
-
-CHECKPOINT = os.path.join(
-    PROJECT_ROOT,
-    "checkpoints",
-    "rl_iteration_53.pt"
-)
-
-REPLAY_BUFFER = os.path.join(
-    PROJECT_ROOT,
-    "checkpoints",
-    "replay_buffer_rl53.pt"
-)
-
-
-# ------------------------------------------------------------
-# IMPORTANT:
-#
-# These are the exact replay indices corresponding to the
-# unstable positions from the previous diagnostic.
 # ------------------------------------------------------------
 
-TARGET_REPLAY_INDICES = [
-    147127,   # Previous Position 18
-    8331,     # Previous Position 11
-    110785,   # Previous Position 27
-    29184,    # Previous Position 01
-    56443,    # Previous Position 31
-]
+PROJECT_DIR = "/kaggle/working/chess-zero"
 
+CHECKPOINT_PATH = (
+    f"{PROJECT_DIR}/checkpoints/rl_iteration_53.pt"
+)
 
-MCTS_SIMULATIONS = [
-    100,
-    200,
-    400,
-    800
-]
+REPLAY_PATH = (
+    f"{PROJECT_DIR}/checkpoints/replay_buffer_rl53.pt"
+)
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-MCTS_BATCH_SIZE = 16
-
-TOP_K = 10
+MCTS_SIMULATIONS = [100, 200, 400, 800]
 
 C_PUCT = 1.5
 
-DEVICE = torch.device(
-    "cuda"
-    if torch.cuda.is_available()
-    else "cpu"
-)
+TOP_K = 10
 
-
-# ============================================================
-# HEADER
-# ============================================================
-
-print("=" * 100)
-print("RL53 MCTS ROOT STATISTICS DIAGNOSTIC")
-print("=" * 100)
-
-print(
-    f"Project:       {PROJECT_ROOT}"
-)
-
-print(
-    f"Checkpoint:    {CHECKPOINT}"
-)
-
-print(
-    f"Replay:        {REPLAY_BUFFER}"
-)
-
-print(
-    f"Device:        {DEVICE}"
-)
-
-print(
-    f"Positions:     {len(TARGET_REPLAY_INDICES)}"
-)
-
-print(
-    f"MCTS tests:    {MCTS_SIMULATIONS}"
-)
-
-print(
-    f"Batch size:    {MCTS_BATCH_SIZE}"
-)
-
-print(
-    f"Top-K:         {TOP_K}"
-)
-
-print(
-    f"c_puct:        {C_PUCT}"
-)
-
-print(
-    "Dirichlet:     OFF"
-)
-
-print("=" * 100)
-
+# These are the unstable cases identified from the previous
+# RL53 diagnostic.
+#
+# (label, replay_index, action)
+TRACE_CASES = [
+    ("P2-A2472", 8331, 2472),
+    ("P3-A263", 110785, 263),
+    ("P3-A191", 110785, 191),
+    ("P4-A1463", 29184, 1463),
+    ("P5-A3186", 56443, 3186),
+]
 
 # ============================================================
-# CUDA
+# ENVIRONMENT
 # ============================================================
 
-if DEVICE.type == "cuda":
-
-    print(
-        "GPU:",
-        torch.cuda.get_device_name(0)
-    )
-
-    print(
-        "CUDA:",
-        torch.version.cuda
-    )
-
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-else:
-
-    print(
-        "WARNING: CUDA is not available."
-    )
-
-
-torch.set_grad_enabled(False)
-
-
-# ============================================================
-# IMPORT PROJECT
-# ============================================================
-
-if PROJECT_ROOT not in sys.path:
-
-    sys.path.insert(
-        0,
-        PROJECT_ROOT
-    )
-
+sys.path.insert(0, PROJECT_DIR)
 
 from model.chess_net import ChessNet
 from environment.gpu_chess import GPUChess
@@ -194,1651 +77,1287 @@ from mcts.gpu_mcts import GPUMCTS
 
 
 # ============================================================
+# HELPERS
+# ============================================================
+
+def banner(title, char="="):
+    print()
+    print(char * 100)
+    print(title)
+    print(char * 100)
+
+
+def load_checkpoint_model(path, device):
+    banner("LOADING RL53 MODEL")
+
+    checkpoint = torch.load(
+        path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    print("Checkpoint type:", type(checkpoint))
+
+    model = ChessNet().to(device)
+
+    if isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            # Some checkpoints may directly contain the state dict.
+            state_dict = checkpoint
+
+    else:
+        raise RuntimeError(
+            f"Unsupported checkpoint type: {type(checkpoint)}"
+        )
+
+    missing, unexpected = model.load_state_dict(
+        state_dict,
+        strict=False,
+    )
+
+    print("Missing keys:", len(missing))
+    print("Unexpected keys:", len(unexpected))
+
+    if missing:
+        print("Missing:", missing)
+
+    if unexpected:
+        print("Unexpected:", unexpected)
+
+    model.eval()
+
+    print("RL53 model loaded successfully.")
+
+    return model
+
+
+def model_predict(model, states):
+    """
+    Returns:
+        policy_logits
+        value
+    """
+
+    model.eval()
+
+    with torch.inference_mode():
+
+        x = states.to(
+            device=DEVICE,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+
+        policy_logits, value = model(x)
+
+        value = value.reshape(-1)
+
+    return policy_logits, value
+
+
+def get_legal_actions(env):
+    """
+    Extract legal action IDs from GPUChess.
+    """
+
+    mask = env.legal_move_mask()
+
+    if mask.ndim == 1:
+        mask = mask.unsqueeze(0)
+
+    actions = torch.nonzero(
+        mask[0],
+        as_tuple=False,
+    ).flatten()
+
+    return actions
+
+
+def print_network_values(
+    model,
+    env,
+    title,
+):
+    banner(title, "-")
+
+    state = env.to_model_input()
+
+    if state.ndim == 3:
+        state = state.unsqueeze(0)
+
+    policy_logits, values = model_predict(
+        model,
+        state,
+    )
+
+    value = float(values[0].item())
+
+    legal_actions = get_legal_actions(env)
+
+    logits = policy_logits[0]
+
+    legal_logits = logits[legal_actions]
+
+    probs = torch.softmax(
+        legal_logits,
+        dim=0,
+    )
+
+    order = torch.argsort(
+        probs,
+        descending=True,
+    )
+
+    print(f"Network value: {value:+.6f}")
+    print(f"Legal moves:   {len(legal_actions)}")
+
+    print()
+    print(
+        "Rank | Action | Network Prob | Logit"
+    )
+    print("-" * 60)
+
+    for rank, idx in enumerate(
+        order[:TOP_K].tolist(),
+        start=1,
+    ):
+
+        action = int(
+            legal_actions[idx].item()
+        )
+
+        probability = float(
+            probs[idx].item()
+        )
+
+        logit = float(
+            legal_logits[idx].item()
+        )
+
+        print(
+            f"{rank:4d} | "
+            f"{action:6d} | "
+            f"{probability:13.6f} | "
+            f"{logit:+.6f}"
+        )
+
+    return value
+
+
+# ============================================================
+# REPLAY STATE RECONSTRUCTION
+# ============================================================
+
+def replay_to_env(sample, device):
+    """
+    Reconstruct GPUChess from the stored 18-plane model state.
+
+    This uses the same reconstruction approach as the previous
+    successful diagnostic.
+    """
+
+    state = sample[0]
+
+    if not torch.is_tensor(state):
+        state = torch.tensor(
+            state,
+            dtype=torch.float32,
+        )
+
+    state = state.to(
+        device=device,
+        dtype=torch.float32,
+    )
+
+    if state.ndim == 4:
+        state = state[0]
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # This section assumes the replay sample's first element
+    # is the stored 18 x 8 x 8 state.
+    #
+    # The previous diagnostic successfully reconstructed these
+    # exact states with zero difference.
+    # --------------------------------------------------------
+
+    env = GPUChess.from_model_input(
+        state.unsqueeze(0)
+    )
+
+    return env
+
+
+# ============================================================
+# SAFE STATE COPY
+# ============================================================
+
+def clone_env(env):
+    """
+    Try to make an independent GPUChess state.
+
+    Uses clone() if available.
+    Otherwise reconstructs through model input.
+    """
+
+    if hasattr(env, "clone"):
+        try:
+            return env.clone()
+        except Exception:
+            pass
+
+    state = env.to_model_input()
+
+    if state.ndim == 3:
+        state = state.unsqueeze(0)
+
+    return GPUChess.from_model_input(
+        state
+    )
+
+
+# ============================================================
+# APPLY ACTION
+# ============================================================
+
+def apply_action(env, action):
+    """
+    Apply one encoded chess action.
+
+    GPUChess versions may expose different method names,
+    so try the common APIs.
+    """
+
+    action_tensor = torch.tensor(
+        [action],
+        dtype=torch.long,
+        device=DEVICE,
+    )
+
+    # --------------------------------------------------------
+    # Preferred GPUChess API
+    # --------------------------------------------------------
+
+    if hasattr(env, "apply_action"):
+        result = env.apply_action(
+            action_tensor
+        )
+
+        if result is None:
+            return env
+
+        return result
+
+    # --------------------------------------------------------
+    # Alternative API
+    # --------------------------------------------------------
+
+    if hasattr(env, "step"):
+        result = env.step(
+            action_tensor
+        )
+
+        if isinstance(result, tuple):
+            return result[0]
+
+        return result
+
+    raise RuntimeError(
+        "GPUChess does not expose apply_action() or step()."
+    )
+
+
+# ============================================================
+# TERMINAL INFORMATION
+# ============================================================
+
+def terminal_info(env):
+    """
+    Inspect terminal-state methods if available.
+
+    This deliberately does not assume a single exact method
+    name because GPUChess has evolved during the project.
+    """
+
+    info = {
+        "terminal": None,
+        "checkmate": None,
+        "stalemate": None,
+        "fifty_move": None,
+        "insufficient_material": None,
+    }
+
+    # Generic terminal check
+    for name in [
+        "is_terminal",
+        "terminal",
+        "is_game_over",
+    ]:
+        if hasattr(env, name):
+
+            obj = getattr(env, name)
+
+            try:
+                value = obj() if callable(obj) else obj
+
+                if torch.is_tensor(value):
+                    value = bool(
+                        value.reshape(-1)[0].item()
+                    )
+
+                info["terminal"] = bool(value)
+                break
+
+            except Exception:
+                pass
+
+    # Checkmate
+    for name in [
+        "is_checkmate",
+        "checkmate",
+    ]:
+        if hasattr(env, name):
+
+            obj = getattr(env, name)
+
+            try:
+                value = obj() if callable(obj) else obj
+
+                if torch.is_tensor(value):
+                    value = bool(
+                        value.reshape(-1)[0].item()
+                    )
+
+                info["checkmate"] = bool(value)
+                break
+
+            except Exception:
+                pass
+
+    # Stalemate
+    for name in [
+        "is_stalemate",
+        "stalemate",
+    ]:
+        if hasattr(env, name):
+
+            obj = getattr(env, name)
+
+            try:
+                value = obj() if callable(obj) else obj
+
+                if torch.is_tensor(value):
+                    value = bool(
+                        value.reshape(-1)[0].item()
+                    )
+
+                info["stalemate"] = bool(value)
+                break
+
+            except Exception:
+                pass
+
+    return info
+
+
+# ============================================================
+# STATE SUMMARY
+# ============================================================
+
+def state_summary(env):
+
+    print("State summary:")
+
+    attrs = [
+        "turn",
+        "castling",
+        "ep_square",
+        "halfmove_clock",
+        "fullmove_number",
+    ]
+
+    for attr in attrs:
+
+        if hasattr(env, attr):
+
+            value = getattr(env, attr)
+
+            try:
+                if torch.is_tensor(value):
+                    value = value.detach().cpu().tolist()
+            except Exception:
+                pass
+
+            print(
+                f"  {attr}: {value}"
+            )
+
+
+# ============================================================
+# DIRECT CHILD INSPECTION
+# ============================================================
+
+def inspect_child(
+    model,
+    root_env,
+    action,
+    label,
+):
+    banner(
+        f"CHILD STATE: {label} | ACTION {action}",
+        "-"
+    )
+
+    print(
+        "Root action:",
+        action
+    )
+
+    child = clone_env(root_env)
+
+    # --------------------------------------------------------
+    # BEFORE
+    # --------------------------------------------------------
+
+    print()
+    print("Before applying action:")
+    state_summary(child)
+
+    root_terminal = terminal_info(child)
+
+    print(
+        "Terminal:",
+        root_terminal
+    )
+
+    # --------------------------------------------------------
+    # APPLY
+    # --------------------------------------------------------
+
+    try:
+
+        child = apply_action(
+            child,
+            action,
+        )
+
+    except Exception as e:
+
+        print()
+        print(
+            "FAILED TO APPLY ACTION"
+        )
+        print(
+            repr(e)
+        )
+        traceback.print_exc()
+
+        return None
+
+    # --------------------------------------------------------
+    # AFTER
+    # --------------------------------------------------------
+
+    print()
+    print("After applying action:")
+    state_summary(child)
+
+    child_terminal = terminal_info(child)
+
+    print(
+        "Terminal:",
+        child_terminal
+    )
+
+    # --------------------------------------------------------
+    # MODEL EVALUATION
+    # --------------------------------------------------------
+
+    state = child.to_model_input()
+
+    if state.ndim == 3:
+        state = state.unsqueeze(0)
+
+    policy_logits, values = model_predict(
+        model,
+        state,
+    )
+
+    child_value = float(
+        values[0].item()
+    )
+
+    legal_actions = get_legal_actions(
+        child
+    )
+
+    print()
+    print(
+        f"Child NN value: {child_value:+.6f}"
+    )
+
+    print(
+        f"Child legal moves: {len(legal_actions)}"
+    )
+
+    # --------------------------------------------------------
+    # CHILD POLICY
+    # --------------------------------------------------------
+
+    logits = policy_logits[0]
+
+    if len(legal_actions) > 0:
+
+        legal_logits = logits[
+            legal_actions
+        ]
+
+        probs = torch.softmax(
+            legal_logits,
+            dim=0,
+        )
+
+        order = torch.argsort(
+            probs,
+            descending=True,
+        )
+
+        print()
+        print(
+            "Top child policy moves:"
+        )
+
+        print(
+            "Rank | Action | Probability"
+        )
+        print("-" * 45)
+
+        for rank, idx in enumerate(
+            order[:TOP_K].tolist(),
+            start=1,
+        ):
+
+            a = int(
+                legal_actions[idx].item()
+            )
+
+            p = float(
+                probs[idx].item()
+            )
+
+            print(
+                f"{rank:4d} | "
+                f"{a:6d} | "
+                f"{p:.6f}"
+            )
+
+    return {
+        "env": child,
+        "value": child_value,
+        "legal_actions": legal_actions,
+        "terminal": child_terminal,
+    }
+
+
+# ============================================================
+# RUN ONE MCTS SEARCH
+# ============================================================
+
+def run_mcts(
+    model,
+    env,
+    simulations,
+):
+    """
+    Run a fresh MCTS search.
+
+    IMPORTANT:
+    We do NOT pass batch_size here because the current
+    GPUMCTS.search() implementation does not require it.
+    """
+
+    search = GPUMCTS(
+        model=model,
+        device=DEVICE,
+        c_puct=C_PUCT,
+    )
+
+    root_states = clone_env(env)
+
+    start = time.time()
+
+    with torch.inference_mode():
+
+        search.search(
+            root_states,
+            num_simulations=simulations,
+            dirichlet_alpha=None,
+            dirichlet_epsilon=0.0,
+        )
+
+    elapsed = time.time() - start
+
+    return search, elapsed
+
+
+# ============================================================
+# ROOT STAT EXTRACTION
+# ============================================================
+
+def root_stats(
+    search,
+    top_k=10,
+):
+    """
+    Extract root child statistics.
+
+    Uses the GPU MCTS internal tree arrays.
+    """
+
+    root_id = int(
+        search._root_ids[0].item()
+    )
+
+    start = int(
+        search.edge_start[root_id].item()
+    )
+
+    count = int(
+        search.edge_count[root_id].item()
+    )
+
+    end = start + count
+
+    actions = search.edge_action[
+        start:end
+    ]
+
+    priors = search.edge_prior[
+        start:end
+    ]
+
+    visits = search.visit_count[
+        start:end
+    ]
+
+    sums = search.value_sum[
+        start:end
+    ]
+
+    root_visits = int(
+        search.visit_count[root_id].item()
+    )
+
+    q = torch.zeros_like(
+        sums,
+        dtype=torch.float32,
+    )
+
+    visited = visits > 0
+
+    q[visited] = (
+        sums[visited]
+        / visits[visited].float()
+    )
+
+    u = (
+        C_PUCT
+        * priors
+        * math.sqrt(
+            max(root_visits, 1)
+        )
+        / (1.0 + visits.float())
+    )
+
+    # Selection score used by this MCTS:
+    #
+    # score = -Q + U
+    #
+    # Therefore smaller Q is preferred when values are from
+    # the child/opponent perspective.
+    puct = -q + u
+
+    order = torch.argsort(
+        puct,
+        descending=True,
+    )
+
+    return {
+        "actions": actions.detach().cpu(),
+        "priors": priors.detach().cpu(),
+        "visits": visits.detach().cpu(),
+        "q": q.detach().cpu(),
+        "u": u.detach().cpu(),
+        "puct": puct.detach().cpu(),
+        "root_visits": root_visits,
+    }, order[:top_k].cpu()
+
+
+# ============================================================
+# PRINT ROOT TOP MOVES
+# ============================================================
+
+def print_root_top(
+    stats,
+    order,
+    simulations,
+):
+
+    print()
+    print(
+        f"MCTS-{simulations}"
+    )
+
+    print(
+        f"Root visits: {stats['root_visits']}"
+    )
+
+    print()
+
+    print(
+        "Rank | Action | "
+        "Prior P | Visits N | "
+        "Q | U | PUCT"
+    )
+
+    print("-" * 80)
+
+    for rank, idx in enumerate(
+        order.tolist(),
+        start=1,
+    ):
+
+        action = int(
+            stats["actions"][idx].item()
+        )
+
+        prior = float(
+            stats["priors"][idx].item()
+        )
+
+        visits = int(
+            stats["visits"][idx].item()
+        )
+
+        q = float(
+            stats["q"][idx].item()
+        )
+
+        u = float(
+            stats["u"][idx].item()
+        )
+
+        puct = float(
+            stats["puct"][idx].item()
+        )
+
+        print(
+            f"{rank:4d} | "
+            f"{action:6d} | "
+            f"{prior:.6f} | "
+            f"{visits:8d} | "
+            f"{q:+.6f} | "
+            f"{u:+.6f} | "
+            f"{puct:+.6f}"
+        )
+
+
+# ============================================================
+# TRACE ROOT ACTION
+# ============================================================
+
+def trace_case(
+    model,
+    replay,
+    label,
+    replay_index,
+    action,
+):
+
+    banner(
+        f"TRACE CASE: {label}",
+        "="
+    )
+
+    print(
+        f"Replay index: {replay_index}"
+    )
+
+    print(
+        f"Root action:  {action}"
+    )
+
+    # --------------------------------------------------------
+    # RECONSTRUCT ROOT
+    # --------------------------------------------------------
+
+    sample = replay[
+        replay_index
+    ]
+
+    root_env = replay_to_env(
+        sample,
+        DEVICE,
+    )
+
+    print()
+    print("ROOT POSITION")
+
+    root_value = print_network_values(
+        model,
+        root_env,
+        "ROOT NETWORK EVALUATION",
+    )
+
+    # --------------------------------------------------------
+    # VERIFY ACTION IS LEGAL
+    # --------------------------------------------------------
+
+    legal_actions = get_legal_actions(
+        root_env
+    )
+
+    legal_set = set(
+        int(x)
+        for x in legal_actions.cpu().tolist()
+    )
+
+    print()
+
+    if action not in legal_set:
+
+        print(
+            f"ERROR: action {action} "
+            "is NOT legal in this position."
+        )
+
+        print(
+            "Legal actions:"
+        )
+
+        print(
+            sorted(legal_set)
+        )
+
+        return
+
+    print(
+        f"Action {action} is LEGAL."
+    )
+
+    # --------------------------------------------------------
+    # DIRECT CHILD
+    # --------------------------------------------------------
+
+    child_info = inspect_child(
+        model=model,
+        root_env=root_env,
+        action=action,
+        label=label,
+    )
+
+    if child_info is None:
+        return
+
+    child_env = child_info["env"]
+
+    # --------------------------------------------------------
+    # CHILD NETWORK VALUE
+    # --------------------------------------------------------
+
+    child_value = child_info["value"]
+
+    print()
+    print(
+        "Root NN value:",
+        f"{root_value:+.6f}",
+    )
+
+    print(
+        "Child NN value:",
+        f"{child_value:+.6f}",
+    )
+
+    print()
+    print(
+        "If the value is expressed from the side-to-move "
+        "perspective, the sign relationship here is important."
+    )
+
+    # --------------------------------------------------------
+    # RUN MCTS AT DIFFERENT DEPTHS
+    # --------------------------------------------------------
+
+    results = {}
+
+    for simulations in MCTS_SIMULATIONS:
+
+        print()
+        print(
+            "=" * 80
+        )
+
+        print(
+            f"RUNNING ROOT MCTS: "
+            f"{simulations} SIMULATIONS"
+        )
+
+        print(
+            "=" * 80
+        )
+
+        try:
+
+            search, elapsed = run_mcts(
+                model,
+                root_env,
+                simulations,
+            )
+
+            stats, order = root_stats(
+                search,
+                TOP_K,
+            )
+
+            results[simulations] = (
+                stats,
+                order,
+            )
+
+            print(
+                f"Elapsed: {elapsed:.3f}s"
+            )
+
+            print_root_top(
+                stats,
+                order,
+                simulations,
+            )
+
+            # ------------------------------------------------
+            # Find traced action
+            # ------------------------------------------------
+
+            actions = stats[
+                "actions"
+            ]
+
+            matches = torch.nonzero(
+                actions == action,
+                as_tuple=False,
+            ).flatten()
+
+            if len(matches) > 0:
+
+                idx = int(
+                    matches[0].item()
+                )
+
+                print()
+                print(
+                    "TRACED ACTION:"
+                )
+
+                print(
+                    f"Action: {action}"
+                )
+
+                print(
+                    f"Prior:  "
+                    f"{float(stats['priors'][idx]):.6f}"
+                )
+
+                print(
+                    f"Visits: "
+                    f"{int(stats['visits'][idx])}"
+                )
+
+                print(
+                    f"Q:      "
+                    f"{float(stats['q'][idx]):+.6f}"
+                )
+
+                print(
+                    f"U:      "
+                    f"{float(stats['u'][idx]):+.6f}"
+                )
+
+                print(
+                    f"PUCT:   "
+                    f"{float(stats['puct'][idx]):+.6f}"
+                )
+
+            else:
+
+                print()
+                print(
+                    "Traced action is not present "
+                    "in root children."
+                )
+
+        except Exception as e:
+
+            print()
+            print(
+                "MCTS ERROR:"
+            )
+
+            print(
+                repr(e)
+            )
+
+            traceback.print_exc()
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    banner(
+        f"SUMMARY: {label}",
+        "-"
+    )
+
+    print(
+        "Simulation | Visits | Q | U | PUCT"
+    )
+
+    print("-" * 65)
+
+    for simulations in MCTS_SIMULATIONS:
+
+        if simulations not in results:
+            continue
+
+        stats, _ = results[
+            simulations
+        ]
+
+        actions = stats[
+            "actions"
+        ]
+
+        matches = torch.nonzero(
+            actions == action,
+            as_tuple=False,
+        ).flatten()
+
+        if len(matches) == 0:
+
+            print(
+                f"{simulations:10d} | "
+                f"NOT FOUND"
+            )
+
+            continue
+
+        idx = int(
+            matches[0].item()
+        )
+
+        visits = int(
+            stats["visits"][idx]
+        )
+
+        q = float(
+            stats["q"][idx]
+        )
+
+        u = float(
+            stats["u"][idx]
+        )
+
+        puct = float(
+            stats["puct"][idx]
+        )
+
+        print(
+            f"{simulations:10d} | "
+            f"{visits:6d} | "
+            f"{q:+.6f} | "
+            f"{u:+.6f} | "
+            f"{puct:+.6f}"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+banner(
+    "RL53 DEEP MCTS CHILD-VALUE / BACKUP DIAGNOSTIC"
+)
+
+print(
+    "Project:",
+    PROJECT_DIR,
+)
+
+print(
+    "Checkpoint:",
+    CHECKPOINT_PATH,
+)
+
+print(
+    "Replay:",
+    REPLAY_PATH,
+)
+
+print(
+    "Device:",
+    DEVICE,
+)
+
+print(
+    "MCTS simulations:",
+    MCTS_SIMULATIONS,
+)
+
+print(
+    "c_puct:",
+    C_PUCT,
+)
+
+print(
+    "Dirichlet:",
+    "OFF",
+)
+
+if torch.cuda.is_available():
+
+    print(
+        "GPU:",
+        torch.cuda.get_device_name(0),
+    )
+
+    print(
+        "CUDA:",
+        torch.version.cuda,
+    )
+
+# ============================================================
 # LOAD MODEL
 # ============================================================
 
-print("\n" + "=" * 100)
-print("LOADING RL53 MODEL")
-print("=" * 100)
-
-
-model = ChessNet().to(DEVICE)
-
-
-checkpoint = torch.load(
-    CHECKPOINT,
-    map_location=DEVICE,
-    weights_only=False
+model = load_checkpoint_model(
+    CHECKPOINT_PATH,
+    DEVICE,
 )
-
-
-print(
-    "Checkpoint type:",
-    type(checkpoint)
-)
-
-
-# ------------------------------------------------------------
-# Extract state dict
-# ------------------------------------------------------------
-
-if isinstance(
-    checkpoint,
-    dict
-):
-
-    if "model_state_dict" in checkpoint:
-
-        state_dict = (
-            checkpoint["model_state_dict"]
-        )
-
-    elif "state_dict" in checkpoint:
-
-        state_dict = (
-            checkpoint["state_dict"]
-        )
-
-    elif (
-        "model" in checkpoint
-        and isinstance(
-            checkpoint["model"],
-            dict
-        )
-    ):
-
-        state_dict = (
-            checkpoint["model"]
-        )
-
-    else:
-
-        state_dict = checkpoint
-
-else:
-
-    raise RuntimeError(
-        f"Unsupported checkpoint format: "
-        f"{type(checkpoint)}"
-    )
-
-
-# ------------------------------------------------------------
-# Remove torch.compile prefix
-# ------------------------------------------------------------
-
-clean_state_dict = {}
-
-for key, value in state_dict.items():
-
-    if key.startswith(
-        "_orig_mod."
-    ):
-
-        key = key[
-            len("_orig_mod.") :
-        ]
-
-    clean_state_dict[key] = value
-
-
-missing, unexpected = (
-    model.load_state_dict(
-        clean_state_dict,
-        strict=False
-    )
-)
-
-
-print(
-    f"Missing keys:       {len(missing)}"
-)
-
-print(
-    f"Unexpected keys:    {len(unexpected)}"
-)
-
-
-if missing:
-
-    print(
-        "Missing:",
-        missing[:10]
-    )
-
-
-if unexpected:
-
-    print(
-        "Unexpected:",
-        unexpected[:10]
-    )
-
-
-model.eval()
-
-
-print(
-    "\nRL53 model loaded successfully."
-)
-
 
 # ============================================================
 # LOAD REPLAY
 # ============================================================
 
-print("\n" + "=" * 100)
-print("LOADING RL53 REPLAY BUFFER")
-print("=" * 100)
-
-
-replay = torch.load(
-    REPLAY_BUFFER,
-    map_location="cpu",
-    weights_only=False
+banner(
+    "LOADING RL53 REPLAY BUFFER"
 )
 
+replay = torch.load(
+    REPLAY_PATH,
+    map_location="cpu",
+    weights_only=False,
+)
 
 print(
     "Replay type:",
-    type(replay)
+    type(replay),
 )
+
+# Handle common replay-buffer formats.
+if hasattr(replay, "buffer"):
+    replay = list(replay.buffer)
+
+elif isinstance(replay, dict):
+
+    if "buffer" in replay:
+        replay = replay["buffer"]
+
+    elif "samples" in replay:
+        replay = replay["samples"]
+
+    else:
+        raise RuntimeError(
+            "Unknown replay dictionary format."
+        )
+
+elif not isinstance(replay, list):
+
+    replay = list(replay)
 
 print(
     "Replay size:",
-    len(replay)
+    len(replay),
 )
 
-
-# ------------------------------------------------------------
-# Verify requested indices
-# ------------------------------------------------------------
-
-for idx in TARGET_REPLAY_INDICES:
-
-    if idx < 0 or idx >= len(replay):
-
-        raise IndexError(
-            f"Replay index {idx} "
-            f"is outside replay buffer."
-        )
-
-
 # ============================================================
-# SELECT EXACT POSITIONS
+# RUN TRACE CASES
 # ============================================================
 
-samples = [
-    replay[idx]
-    for idx in TARGET_REPLAY_INDICES
-]
+for (
+    label,
+    replay_index,
+    action,
+) in TRACE_CASES:
 
+    try:
 
-print("\nSelected positions:")
+        trace_case(
+            model=model,
+            replay=replay,
+            label=label,
+            replay_index=replay_index,
+            action=action,
+        )
 
-for i, idx in enumerate(
-    TARGET_REPLAY_INDICES
-):
+    except Exception as e:
 
-    print(
-        f"  Position {i + 1}: "
-        f"replay index {idx}"
-    )
+        print()
+        print(
+            "=" * 100
+        )
 
+        print(
+            f"FAILED CASE: {label}"
+        )
+
+        print(
+            repr(e)
+        )
+
+        traceback.print_exc()
 
 # ============================================================
-# RECONSTRUCT GPUChess
+# FINAL
 # ============================================================
 
-def replay_states_to_gpu_chess(
-    samples,
-    device
-):
-
-    states_np = np.stack(
-        [
-            np.asarray(
-                sample[0],
-                dtype=np.float32
-            )
-            for sample in samples
-        ],
-        axis=0
-    )
-
-
-    states = torch.from_numpy(
-        states_np
-    ).to(
-        device=device,
-        dtype=torch.float32
-    )
-
-
-    B = states.shape[0]
-
-
-    if states.shape != (
-        B,
-        18,
-        8,
-        8
-    ):
-
-        raise ValueError(
-            f"Unexpected state shape: "
-            f"{states.shape}"
-        )
-
-
-    chess = GPUChess(
-        device=device,
-        batch_size=B
-    )
-
-
-    # ========================================================
-    # PIECE PLANES
-    # ========================================================
-
-    board_planes = (
-        states[:, :12]
-        .flip(2)
-    )
-
-
-    square_bits = (
-        chess.square_bits
-    )
-
-
-    pieces = torch.zeros(
-        (B, 12),
-        dtype=torch.int64,
-        device=device
-    )
-
-
-    for piece_type in range(12):
-
-        occupancy = (
-            board_planes[
-                :,
-                piece_type
-            ]
-            .reshape(B, 64)
-            > 0.5
-        )
-
-
-        bitboard = torch.zeros(
-            (B,),
-            dtype=torch.int64,
-            device=device
-        )
-
-
-        for square in range(64):
-
-            bitboard = torch.where(
-                occupancy[:, square],
-                bitboard
-                | square_bits[square],
-                bitboard
-            )
-
-
-        pieces[
-            :,
-            piece_type
-        ] = bitboard
-
-
-    chess.pieces = pieces
-
-
-    # ========================================================
-    # SIDE TO MOVE
-    # ========================================================
-
-    white_to_move = (
-        states[:, 12, 0, 0]
-        > 0.5
-    )
-
-
-    chess.turn = (
-        ~white_to_move
-    )
-
-
-    # ========================================================
-    # CASTLING
-    # ========================================================
-
-    castling = torch.zeros(
-        (B,),
-        dtype=torch.int16,
-        device=device
-    )
-
-
-    WK = 1
-    WQ = 2
-    BK = 4
-    BQ = 8
-
-
-    castling |= torch.where(
-        states[:, 13, 0, 0] > 0.5,
-
-        torch.tensor(
-            WK,
-            dtype=torch.int16,
-            device=device
-        ),
-
-        torch.tensor(
-            0,
-            dtype=torch.int16,
-            device=device
-        )
-    )
-
-
-    castling |= torch.where(
-        states[:, 14, 0, 0] > 0.5,
-
-        torch.tensor(
-            WQ,
-            dtype=torch.int16,
-            device=device
-        ),
-
-        torch.tensor(
-            0,
-            dtype=torch.int16,
-            device=device
-        )
-    )
-
-
-    castling |= torch.where(
-        states[:, 15, 0, 0] > 0.5,
-
-        torch.tensor(
-            BK,
-            dtype=torch.int16,
-            device=device
-        ),
-
-        torch.tensor(
-            0,
-            dtype=torch.int16,
-            device=device
-        )
-    )
-
-
-    castling |= torch.where(
-        states[:, 16, 0, 0] > 0.5,
-
-        torch.tensor(
-            BQ,
-            dtype=torch.int16,
-            device=device
-        ),
-
-        torch.tensor(
-            0,
-            dtype=torch.int16,
-            device=device
-        )
-    )
-
-
-    chess.castling = castling
-
-
-    # ========================================================
-    # EN PASSANT
-    # ========================================================
-
-    ep_plane = (
-        states[:, 17]
-        .flip(1)
-        .reshape(B, 64)
-        > 0.5
-    )
-
-
-    ep_exists = ep_plane.any(
-        dim=1
-    )
-
-
-    ep_square = torch.full(
-        (B,),
-        -1,
-        dtype=torch.int16,
-        device=device
-    )
-
-
-    if bool(ep_exists.any()):
-
-        rows = torch.nonzero(
-            ep_exists,
-            as_tuple=False
-        ).flatten()
-
-
-        squares = torch.argmax(
-            ep_plane[rows].to(
-                torch.int8
-            ),
-            dim=1
-        )
-
-
-        ep_square[rows] = (
-            squares.to(
-                torch.int16
-            )
-        )
-
-
-    chess.ep_square = ep_square
-
-
-    # ========================================================
-    # CLOCKS
-    # ========================================================
-
-    chess.halfmove_clock = (
-        torch.zeros(
-            (B,),
-            dtype=torch.int16,
-            device=device
-        )
-    )
-
-
-    chess.fullmove_number = (
-        torch.ones(
-            (B,),
-            dtype=torch.int16,
-            device=device
-        )
-    )
-
-
-    return chess
-
-
-# ============================================================
-# BUILD POSITIONS
-# ============================================================
-
-print("\n" + "=" * 100)
-print("RECONSTRUCTING POSITIONS")
-print("=" * 100)
-
-
-root_states = (
-    replay_states_to_gpu_chess(
-        samples,
-        DEVICE
-    )
-)
-
-
-print(
-    "Reconstruction complete."
-)
-
-
-# ============================================================
-# VERIFY EXACT STATE
-# ============================================================
-
-print(
-    "\nVerifying state reconstruction..."
-)
-
-
-reconstructed = (
-    root_states.to_model_input()
-)
-
-
-original = torch.from_numpy(
-    np.stack(
-        [
-            np.asarray(
-                sample[0],
-                dtype=np.float32
-            )
-            for sample in samples
-        ]
-    )
-).to(DEVICE)
-
-
-max_diff = (
-    reconstructed
-    - original
-).abs().max().item()
-
-
-mean_diff = (
-    reconstructed
-    - original
-).abs().mean().item()
-
-
-print(
-    f"Maximum difference: "
-    f"{max_diff:.10f}"
+banner(
+    "DIAGNOSTIC FINISHED"
 )
 
 print(
-    f"Mean difference:    "
-    f"{mean_diff:.10f}"
-)
-
-
-if max_diff > 1e-5:
-
-    raise RuntimeError(
-        "State reconstruction failed."
-    )
-
-
-print(
-    "State reconstruction verified."
-)
-
-
-# ============================================================
-# LEGAL MOVE MASK
-# ============================================================
-
-print(
-    "\nGenerating legal moves..."
-)
-
-
-legal_mask = (
-    root_states.legal_move_mask()
-)
-
-
-legal_counts = (
-    legal_mask
-    .sum(dim=1)
-)
-
-
-for i in range(
-    len(TARGET_REPLAY_INDICES)
-):
-
-    print(
-        f"Position {i + 1}: "
-        f"{int(legal_counts[i].item())} "
-        f"legal moves"
-    )
-
-
-# ============================================================
-# NETWORK ROOT EVALUATION
-# ============================================================
-
-print("\n" + "=" * 100)
-print("NETWORK ROOT EVALUATION")
-print("=" * 100)
-
-
-with torch.inference_mode():
-
-    model_input = (
-        root_states.to_model_input()
-    )
-
-
-    if DEVICE.type == "cuda":
-
-        model_input = (
-            model_input.contiguous(
-                memory_format=torch.channels_last
-            )
-        )
-
-
-        with torch.autocast(
-            device_type="cuda",
-            dtype=torch.float16
-        ):
-
-            network_logits, network_values = (
-                model(model_input)
-            )
-
-    else:
-
-        network_logits, network_values = (
-            model(model_input)
-        )
-
-
-network_logits = (
-    network_logits.float()
-)
-
-network_values = (
-    network_values
-    .squeeze(-1)
-    .float()
-)
-
-
-# ------------------------------------------------------------
-# Mask to legal moves
-# ------------------------------------------------------------
-
-masked_logits = (
-    network_logits.masked_fill(
-        ~legal_mask,
-        torch.finfo(
-            network_logits.dtype
-        ).min
-    )
-)
-
-
-network_policy = (
-    torch.softmax(
-        masked_logits,
-        dim=1
-    )
-)
-
-
-network_policy = (
-    network_policy
-    * legal_mask.float()
-)
-
-
-network_policy = (
-    network_policy
-    /
-    network_policy.sum(
-        dim=1,
-        keepdim=True
-    ).clamp_min(1e-12)
-)
-
-
-for i in range(
-    len(TARGET_REPLAY_INDICES)
-):
-
-    print(
-        f"\nPosition {i + 1}"
-    )
-
-    print(
-        f"Replay index: "
-        f"{TARGET_REPLAY_INDICES[i]}"
-    )
-
-    print(
-        f"Network value: "
-        f"{network_values[i].item():+.6f}"
-    )
-
-
-# ============================================================
-# MCTS ROOT STAT EXTRACTION
-# ============================================================
-
-def extract_root_statistics(
-    search,
-    position_idx,
-    top_k=10
-):
-
     """
-    Extract root-child statistics directly from the
-    GPUMCTS internal tree.
-
-    Returns:
-
-        action
-        prior P
-        visits N
-        Q
-        U
-        PUCT
-    """
-
-
-    # --------------------------------------------------------
-    # Root IDs
-    # --------------------------------------------------------
-
-    roots = search._root_ids
-
-
-    root_id = (
-        roots[position_idx]
-        .item()
-    )
-
-
-    # --------------------------------------------------------
-    # Root edge range
-    # --------------------------------------------------------
-
-    start = int(
-        search.edge_start[
-            root_id
-        ].item()
-    )
-
-
-    count = int(
-        search.edge_count[
-            root_id
-        ].item()
-    )
-
-
-    if count <= 0:
-
-        return []
-
-
-    edge_ids = torch.arange(
-        start,
-        start + count,
-        device=DEVICE,
-        dtype=torch.long
-    )
-
-
-    # --------------------------------------------------------
-    # Child nodes
-    # --------------------------------------------------------
-
-    child_nodes = (
-        search.edge_child[
-            edge_ids
-        ]
-        .to(torch.long)
-    )
-
-
-    # --------------------------------------------------------
-    # Action
-    # --------------------------------------------------------
-
-    actions = (
-        search.edge_action[
-            edge_ids
-        ]
-        .to(torch.long)
-    )
-
-
-    # --------------------------------------------------------
-    # Prior P
-    # --------------------------------------------------------
-
-    priors = (
-        search.edge_prior[
-            edge_ids
-        ]
-        .float()
-    )
-
-
-    # --------------------------------------------------------
-    # Visit count N
-    # --------------------------------------------------------
-
-    visits = (
-        search.visit_count[
-            child_nodes
-        ]
-        .float()
-    )
-
-
-    # --------------------------------------------------------
-    # Value sum
-    # --------------------------------------------------------
-
-    value_sum = (
-        search.value_sum[
-            child_nodes
-        ]
-        .float()
-    )
-
-
-    # --------------------------------------------------------
-    # Q value
-    #
-    # Q = value_sum / visits
-    # --------------------------------------------------------
-
-    q_values = torch.where(
-        visits > 0,
-        value_sum / visits,
-        torch.zeros_like(
-            value_sum
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # Parent visit count
-    # --------------------------------------------------------
-
-    parent_visits = (
-        search.visit_count[
-            root_id
-        ]
-        .float()
-        .clamp_min(1.0)
-    )
-
-
-    # --------------------------------------------------------
-    # Exploration term U
-    #
-    # U =
-    # c_puct * P * sqrt(N_parent) / (1 + N_child)
-    # --------------------------------------------------------
-
-    exploration = (
-        C_PUCT
-        * priors
-        * torch.sqrt(
-            parent_visits
-        )
-        /
-        (1.0 + visits)
-    )
-
-
-    # --------------------------------------------------------
-    # PUCT score
-    #
-    # Matches the search implementation:
-    #
-    # score = -Q + U
-    # --------------------------------------------------------
-
-    puct_scores = (
-        -q_values
-        + exploration
-    )
-
-
-    # --------------------------------------------------------
-    # Sort by visit count
-    # --------------------------------------------------------
-
-    order = torch.argsort(
-        visits,
-        descending=True
-    )
-
-
-    order = order[
-        :min(
-            top_k,
-            count
-        )
-    ]
-
-
-    results = []
-
-
-    for j in order.tolist():
-
-        results.append({
-
-            "action":
-                int(
-                    actions[j].item()
-                ),
-
-            "prior":
-                float(
-                    priors[j].item()
-                ),
-
-            "visits":
-                int(
-                    visits[j].item()
-                ),
-
-            "q":
-                float(
-                    q_values[j].item()
-                ),
-
-            "u":
-                float(
-                    exploration[j].item()
-                ),
-
-            "puct":
-                float(
-                    puct_scores[j].item()
-                )
-        })
-
-
-    return results
-
-
-# ============================================================
-# RUN MCTS
-# ============================================================
-
-all_searches = {}
-
-all_stats = {}
-
-
-for simulations in (
-    MCTS_SIMULATIONS
-):
-
-    print("\n\n" + "=" * 100)
-
-    print(
-        f"RUNNING MCTS "
-        f"WITH {simulations} SIMULATIONS"
-    )
-
-    print("=" * 100)
-
-
-    search = GPUMCTS(
-        model=model,
-        device=DEVICE,
-        c_puct=C_PUCT
-    )
-
-
-    if DEVICE.type == "cuda":
-
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-        start_event = torch.cuda.Event(
-            enable_timing=True
-        )
-
-        end_event = torch.cuda.Event(
-            enable_timing=True
-        )
-
-        start_event.record()
-
-    else:
-
-        start_time = time.perf_counter()
-
-
-    with torch.inference_mode():
-
-        search.search(
-            root_states.clone(),
-            num_simulations=simulations,
-            dirichlet_alpha=None,
-            dirichlet_epsilon=0.0,
-            batch_size=MCTS_BATCH_SIZE
-        )
-
-
-    if DEVICE.type == "cuda":
-
-        end_event.record()
-
-        torch.cuda.synchronize()
-
-        elapsed_ms = (
-            start_event.elapsed_time(
-                end_event
-            )
-        )
-
-    else:
-
-        elapsed_ms = (
-            time.perf_counter()
-            - start_time
-        ) * 1000.0
-
-
-    all_searches[
-        simulations
-    ] = search
-
-
-    all_stats[
-        simulations
-    ] = {}
-
-
-    print(
-        f"Elapsed: "
-        f"{elapsed_ms / 1000:.2f}s"
-    )
-
-
-    # --------------------------------------------------------
-    # Extract root statistics
-    # --------------------------------------------------------
-
-    for position_idx in range(
-        len(TARGET_REPLAY_INDICES)
-    ):
-
-        stats = (
-            extract_root_statistics(
-                search,
-                position_idx,
-                TOP_K
-            )
-        )
-
-
-        all_stats[
-            simulations
-        ][position_idx] = stats
-
-
-# ============================================================
-# PRINT ROOT STATISTICS
-# ============================================================
-
-for position_idx, replay_idx in enumerate(
-    TARGET_REPLAY_INDICES
-):
-
-    print("\n\n" + "#" * 100)
-
-    print(
-        f"POSITION {position_idx + 1}"
-    )
-
-    print(
-        f"Replay index: {replay_idx}"
-    )
-
-    print(
-        f"Legal moves: "
-        f"{int(legal_counts[position_idx].item())}"
-    )
-
-    print(
-        f"Network value: "
-        f"{network_values[position_idx].item():+.6f}"
-    )
-
-    print("#" * 100)
-
-
-    for simulations in (
-        MCTS_SIMULATIONS
-    ):
-
-        search = (
-            all_searches[
-                simulations
-            ]
-        )
-
-
-        stats = (
-            all_stats[
-                simulations
-            ][position_idx]
-        )
-
-
-        root_id = (
-            search._root_ids[
-                position_idx
-            ]
-            .item()
-        )
-
-
-        root_visits = int(
-            search.visit_count[
-                root_id
-            ].item()
-        )
-
-
-        root_value_sum = float(
-            search.value_sum[
-                root_id
-            ].item()
-        )
-
-
-        root_q = (
-            root_value_sum
-            / root_visits
-            if root_visits > 0
-            else 0.0
-        )
-
-
-        print(
-            "\n"
-            + "-" * 100
-        )
-
-        print(
-            f"MCTS-{simulations}"
-        )
-
-        print(
-            f"Root visits: "
-            f"{root_visits}"
-        )
-
-        print(
-            f"Root value sum: "
-            f"{root_value_sum:+.6f}"
-        )
-
-        print(
-            f"Root Q: "
-            f"{root_q:+.6f}"
-        )
-
-
-        print(
-            "\n"
-            "Rank | Action | Prior P | "
-            "Visits N | Q value | "
-            "U | PUCT"
-        )
-
-        print(
-            "-" * 100
-        )
-
-
-        for rank, item in enumerate(
-            stats,
-            start=1
-        ):
-
-            print(
-                f"{rank:4d} | "
-                f"{item['action']:6d} | "
-                f"{item['prior']:.6f} | "
-                f"{item['visits']:8d} | "
-                f"{item['q']:+.6f} | "
-                f"{item['u']:.6f} | "
-                f"{item['puct']:+.6f}"
-            )
-
-
-# ============================================================
-# CROSS-DEPTH MOVE TRACKING
-# ============================================================
-
-print("\n\n" + "=" * 100)
-print("CROSS-DEPTH MOVE TRACKING")
-print("=" * 100)
-
-
-for position_idx, replay_idx in enumerate(
-    TARGET_REPLAY_INDICES
-):
-
-    print(
-        "\n"
-        + "#" * 100
-    )
-
-    print(
-        f"POSITION {position_idx + 1} "
-        f"(replay {replay_idx})"
-    )
-
-    print(
-        "#" * 100
-    )
-
-
-    # Collect all actions appearing in
-    # top-K at any search depth.
-
-    action_set = set()
-
-
-    for simulations in (
-        MCTS_SIMULATIONS
-    ):
-
-        for item in all_stats[
-            simulations
-        ][position_idx]:
-
-            action_set.add(
-                item["action"]
-            )
-
-
-    # --------------------------------------------------------
-    # Print each important action across depths
-    # --------------------------------------------------------
-
-    for action in sorted(
-        action_set
-    ):
-
-        print(
-            "\nAction:",
-            action
-        )
-
-
-        for simulations in (
-            MCTS_SIMULATIONS
-        ):
-
-            stats = (
-                all_stats[
-                    simulations
-                ][position_idx]
-            )
-
-
-            found = None
-
-
-            for item in stats:
-
-                if (
-                    item["action"]
-                    == action
-                ):
-
-                    found = item
-                    break
-
-
-            if found is None:
-
-                print(
-                    f"  {simulations:3d}: "
-                    f"not top-{TOP_K}"
-                )
-
-            else:
-
-                print(
-                    f"  {simulations:3d}: "
-                    f"N={found['visits']:4d}, "
-                    f"P={found['prior']:.4f}, "
-                    f"Q={found['q']:+.4f}, "
-                    f"U={found['u']:.4f}, "
-                    f"PUCT={found['puct']:+.4f}"
-                )
-
-
-# ============================================================
-# TOP-1 TRACKING
-# ============================================================
-
-print("\n\n" + "=" * 100)
-print("TOP-1 MOVE TRACKING")
-print("=" * 100)
-
-
-for position_idx, replay_idx in enumerate(
-    TARGET_REPLAY_INDICES
-):
-
-    print(
-        f"\nPosition {position_idx + 1} "
-        f"(replay {replay_idx})"
-    )
-
-
-    for simulations in (
-        MCTS_SIMULATIONS
-    ):
-
-        stats = (
-            all_stats[
-                simulations
-            ][position_idx]
-        )
-
-
-        if not stats:
-
-            print(
-                f"  {simulations}: "
-                f"NO ROOT CHILDREN"
-            )
-
-            continue
-
-
-        top = stats[0]
-
-
-        print(
-            f"  {simulations:3d}: "
-            f"action={top['action']:4d}, "
-            f"N={top['visits']:4d}, "
-            f"P={top['prior']:.5f}, "
-            f"Q={top['q']:+.5f}, "
-            f"U={top['u']:.5f}, "
-            f"PUCT={top['puct']:+.5f}"
-        )
-
-
-# ============================================================
-# TOP-1 CHANGES
-# ============================================================
-
-print("\n\n" + "=" * 100)
-print("TOP-1 CHANGES")
-print("=" * 100)
-
-
-for position_idx, replay_idx in enumerate(
-    TARGET_REPLAY_INDICES
-):
-
-    top_actions = []
-
-
-    for simulations in (
-        MCTS_SIMULATIONS
-    ):
-
-        stats = (
-            all_stats[
-                simulations
-            ][position_idx]
-        )
-
-
-        if stats:
-
-            top_actions.append(
-                stats[0]["action"]
-            )
-
-        else:
-
-            top_actions.append(
-                None
-            )
-
-
-    print(
-        f"\nPosition {position_idx + 1} "
-        f"(replay {replay_idx})"
-    )
-
-
-    print(
-        f"  100: {top_actions[0]}"
-    )
-
-    print(
-        f"  200: {top_actions[1]}"
-    )
-
-    print(
-        f"  400: {top_actions[2]}"
-    )
-
-    print(
-        f"  800: {top_actions[3]}"
-    )
-
-
-# ============================================================
-# ROOT VALUE COMPARISON
-# ============================================================
-
-print("\n\n" + "=" * 100)
-print("ROOT VALUE COMPARISON")
-print("=" * 100)
-
-
-print(
-    f"{'Position':>10} "
-    f"{'Replay':>10} "
-    f"{'Network':>12} "
-    f"{'MCTS100':>12} "
-    f"{'MCTS200':>12} "
-    f"{'MCTS400':>12} "
-    f"{'MCTS800':>12}"
-)
-
-
-print("-" * 90)
-
-
-for position_idx, replay_idx in enumerate(
-    TARGET_REPLAY_INDICES
-):
-
-    values = []
-
-
-    for simulations in (
-        MCTS_SIMULATIONS
-    ):
-
-        search = (
-            all_searches[
-                simulations
-            ]
-        )
-
-
-        root_id = (
-            search._root_ids[
-                position_idx
-            ]
-            .item()
-        )
-
-
-        visits = float(
-            search.visit_count[
-                root_id
-            ].item()
-        )
-
-
-        value_sum = float(
-            search.value_sum[
-                root_id
-            ].item()
-        )
-
-
-        root_q = (
-            value_sum / visits
-            if visits > 0
-            else 0.0
-        )
-
-
-        values.append(
-            root_q
-        )
-
-
-    print(
-        f"{position_idx + 1:>10} "
-        f"{replay_idx:>10} "
-        f"{network_values[position_idx].item():>+12.5f} "
-        f"{values[0]:>+12.5f} "
-        f"{values[1]:>+12.5f} "
-        f"{values[2]:>+12.5f} "
-        f"{values[3]:>+12.5f}"
-    )
-
-
-# ============================================================
-# FINAL DIAGNOSTIC GUIDE
-# ============================================================
-
-print("\n\n" + "=" * 100)
-print("WHAT WE ARE LOOKING FOR")
-print("=" * 100)
-
-
-print(
+Do NOT start RL54 from this output alone.
+
+The important things to inspect are:
+
+1. Root NN value
+2. Child NN value immediately after the traced move
+3. Whether the child is terminal
+4. Child legal-move count
+5. Root action Q across 100/200/400/800
+6. Whether Q changes because the search reaches different
+   child states or because backup/sign handling is inconsistent
+
+Especially inspect:
+
+    P2-A2472
+    P3-A263
+    P3-A191
+    P4-A1463
+    P5-A3186
 """
-For each unstable position, inspect:
-
-    Prior P
-    Visits N
-    Q
-    U
-    PUCT
-
-
-IMPORTANT:
-
-PUCT in this implementation is:
-
-    PUCT = -Q + c_puct * P * sqrt(N_parent) / (1 + N_child)
-
-
-So:
-
-    P       = neural network prior
-    Q       = backed-up value estimate
-    U       = exploration pressure
-    N       = search visits
-
-
-------------------------------------------------------------
-CASE 1 — HEALTHY SEARCH
-------------------------------------------------------------
-
-A move may start with:
-
-    high P
-    low N
-
-and then gain visits because its Q value looks good.
-
-As simulations increase, its N should generally become
-more concentrated if the search is finding something useful.
-
-
-------------------------------------------------------------
-CASE 2 — VALUE-DRIVEN RE-RANKING
-------------------------------------------------------------
-
-If:
-
-    P is relatively low
-    but Q becomes substantially better
-
-and that move gains many visits,
-
-then MCTS is using the value network to override the
-policy prior.
-
-That is potentially useful search behavior.
-
-
-------------------------------------------------------------
-CASE 3 — VALUE INSTABILITY
-------------------------------------------------------------
-
-If the same move's Q changes dramatically:
-
-    MCTS-100
-    MCTS-200
-    MCTS-400
-    MCTS-800
-
-and this causes the top move to change,
-
-then we need to investigate the value estimates.
-
-
-------------------------------------------------------------
-CASE 4 — PRIOR / PUCT DOMINATION
-------------------------------------------------------------
-
-If Q values are very similar between moves but one move
-continually wins because of P and U,
-
-then the behavior is more strongly driven by the policy
-prior and exploration term.
-
-
-------------------------------------------------------------
-CASE 5 — SEARCH INSTABILITY
-------------------------------------------------------------
-
-If:
-
-    Q values oscillate
-    top move changes
-    visit distribution changes strongly
-    and the same position does not settle by 800
-
-then we should inspect:
-
-    - value network
-    - backup signs
-    - PUCT implementation
-    - terminal handling
-    - tree expansion
-    - repeated-state handling
-
-
-DO NOT CHANGE RL54 YET.
-
-This test is specifically intended to tell us WHICH PART
-of the search is responsible for the instability.
-"""
-)
-
-
-print(
-    "\n" + "=" * 100
-)
-
-print(
-    "RL53 ROOT STATISTICS DIAGNOSTIC FINISHED"
-)
-
-print(
-    "=" * 100
 )
