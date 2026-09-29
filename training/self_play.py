@@ -1,660 +1,1559 @@
-"""GPU-first AlphaZero-style self-play.
+"""Tensorized GPU Monte-Carlo Tree Search.
 
-The training self-play path uses the tensorized GPU chess engine and GPU MCTS
-when the model is on CUDA.  A small legacy CPU fallback is retained for local
-CPU use and for tools that still rely on python-chess.
+The tree, chess states, move generation, PUCT statistics, and neural-network
+leaf evaluations all live on the selected torch device.  No python-chess board
+or per-node Python object is used in the hot path.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
-import os
-import random
-import shutil
-import tempfile
-import multiprocessing as mp
-
-import numpy as np
 import torch
 
-from environment.gpu_chess import GPUChess
-from mcts.gpu_mcts import GPUMCTS
+from environment.gpu_chess import GPUChess, MAX_LEGAL_MOVES
 
 
 @dataclass
-class TrainingSample:
-    state: np.ndarray
-    policy: np.ndarray
-    player: int
+class GPUSearchResult:
+    actions: torch.Tensor
+    policy: torch.Tensor
 
 
-@dataclass
-class SelfPlayResult:
-    training_data: list
-    result: int | None
-    termination: str
-    moves_played: int
-    completed: bool
+class GPUMCTS:
+    def __init__(
+        self,
+        model,
+        action_encoder=None,
+        device: Optional[torch.device | str] = None,
+        c_puct: float = 1.5,
+        max_children: int = MAX_LEGAL_MOVES,
+    ):
+        self.model = model
+        self.device = (
+            torch.device(device)
+            if device is not None
+            else next(model.parameters()).device
+        )
+        self.action_encoder = action_encoder
 
+        if self.action_encoder is not None and self.action_encoder.size() != 4544:
+            raise ValueError("GPUMCTS requires the project's 4544-action space.")
 
-class SelfPlayGame:
-    def __init__(self):
-        self.samples = []
+        self.c_puct = float(c_puct)
+        self.max_children = int(max_children)
 
-    def add_position(self, state: np.ndarray, policy: np.ndarray, player: int):
-        self.samples.append(
-            TrainingSample(
-                state=np.asarray(state, dtype=np.float32),
-                policy=np.asarray(policy, dtype=np.float32),
-                player=int(player),
+        if self.max_children < 218:
+            raise ValueError(
+                "max_children must be at least 218 for the full chess action space."
             )
+
+        self.chess = GPUChess(self.device, 1)
+        self._reset_tree()
+
+    def _reset_tree(self):
+        self.num_games = 0
+        self.max_nodes = 0
+        self.max_edges = 0
+
+        self.pieces = None
+        self.turn = None
+        self.castling = None
+        self.ep_square = None
+        self.halfmove_clock = None
+        self.fullmove_number = None
+
+        self.parent = None
+        self.visit_count = None
+        self.value_sum = None
+        self.expanded = None
+        self.terminal = None
+
+        self.edge_start = None
+        self.edge_count = None
+        self.edge_child = None
+        self.edge_action = None
+        self.edge_prior = None
+        self.edge_valid = None
+
+        self.edge_used = 0
+
+        # Reused indexing buffers.
+        self._child_cols = None
+        self._edge_ids = None
+        self._root_ids = None
+        self._action_ids = None
+
+    def _allocate(self, num_games: int, num_simulations: int):
+        # One root plus at most one newly expanded leaf per simulation and game.
+        #
+        # Each expansion can have at most 218 legal chess moves.
+        # max_children is normally 256.
+        expansions = num_games * (max(1, num_simulations) + 1)
+
+        self.max_nodes = (
+            num_games + expansions * self.max_children
+        )
+        self.max_edges = expansions * self.max_children
+        self.num_games = num_games
+
+        dev = self.device
+
+        self.pieces = torch.zeros(
+            (self.max_nodes, 12),
+            dtype=torch.int64,
+            device=dev,
         )
 
-    def get_training_data(self, result):
-        data = []
-        for sample in self.samples:
-            if result == 0:
-                value = 0.0
-            elif result == 1:
-                value = float(sample.player)
+        self.turn = torch.zeros(
+            (self.max_nodes,),
+            dtype=torch.bool,
+            device=dev,
+        )
+
+        self.castling = torch.zeros(
+            (self.max_nodes,),
+            dtype=torch.int16,
+            device=dev,
+        )
+
+        self.ep_square = torch.full(
+            (self.max_nodes,),
+            -1,
+            dtype=torch.int16,
+            device=dev,
+        )
+
+        self.halfmove_clock = torch.zeros(
+            (self.max_nodes,),
+            dtype=torch.int16,
+            device=dev,
+        )
+
+        self.fullmove_number = torch.ones(
+            (self.max_nodes,),
+            dtype=torch.int16,
+            device=dev,
+        )
+
+        self.parent = torch.full(
+            (self.max_nodes,),
+            -1,
+            dtype=torch.int32,
+            device=dev,
+        )
+
+        self.visit_count = torch.zeros(
+            (self.max_nodes,),
+            dtype=torch.int32,
+            device=dev,
+        )
+
+        self.value_sum = torch.zeros(
+            (self.max_nodes,),
+            dtype=torch.float32,
+            device=dev,
+        )
+
+        self.expanded = torch.zeros(
+            (self.max_nodes,),
+            dtype=torch.bool,
+            device=dev,
+        )
+
+        self.terminal = torch.zeros(
+            (self.max_nodes,),
+            dtype=torch.bool,
+            device=dev,
+        )
+
+        self.edge_start = torch.full(
+            (self.max_nodes,),
+            -1,
+            dtype=torch.int32,
+            device=dev,
+        )
+
+        self.edge_count = torch.zeros(
+            (self.max_nodes,),
+            dtype=torch.int16,
+            device=dev,
+        )
+
+        self.edge_child = torch.full(
+            (self.max_edges,),
+            -1,
+            dtype=torch.int32,
+            device=dev,
+        )
+
+        self.edge_action = torch.zeros(
+            (self.max_edges,),
+            dtype=torch.int16,
+            device=dev,
+        )
+
+        self.edge_prior = torch.zeros(
+            (self.max_edges,),
+            dtype=torch.float32,
+            device=dev,
+        )
+
+        self.edge_valid = torch.zeros(
+            (self.max_edges,),
+            dtype=torch.bool,
+            device=dev,
+        )
+
+        self.edge_used = 0
+
+        self._child_cols = torch.arange(
+            self.max_children,
+            device=dev,
+            dtype=torch.long,
+        )
+
+        self._edge_ids = torch.arange(
+            self.max_edges,
+            device=dev,
+            dtype=torch.long,
+        )
+
+        self._root_ids = torch.arange(
+            self.num_games,
+            device=dev,
+            dtype=torch.long,
+        )
+
+        self._action_ids = torch.arange(
+            4544,
+            device=dev,
+            dtype=torch.long,
+        )
+
+    def _state_view(self, node_ids: torch.Tensor) -> GPUChess:
+        """Create a lightweight GPUChess view containing selected tree nodes."""
+
+        g = object.__new__(GPUChess)
+        g.__dict__ = self.chess.__dict__.copy()
+
+        g.batch_size = int(node_ids.numel())
+
+        g.pieces = self.pieces[node_ids]
+        g.turn = self.turn[node_ids]
+        g.castling = self.castling[node_ids]
+        g.ep_square = self.ep_square[node_ids]
+        g.halfmove_clock = self.halfmove_clock[node_ids]
+        g.fullmove_number = self.fullmove_number[node_ids]
+
+        return g
+
+    def _write_states(
+        self,
+        node_ids: torch.Tensor,
+        states: GPUChess,
+    ):
+        self.pieces[node_ids] = states.pieces
+        self.turn[node_ids] = states.turn
+        self.castling[node_ids] = states.castling
+        self.ep_square[node_ids] = states.ep_square
+        self.halfmove_clock[node_ids] = states.halfmove_clock
+        self.fullmove_number[node_ids] = states.fullmove_number
+
+    def _evaluate(
+        self,
+        node_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        states = self._state_view(node_ids)
+
+        model_input = states.to_model_input()
+
+        if model_input.is_cuda:
+            model_input = model_input.contiguous(
+                memory_format=torch.channels_last
+            )
+
+        with torch.inference_mode():
+            if self.device.type == "cuda":
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.float16,
+                ):
+                    logits, values = self.model(model_input)
             else:
-                value = float(-sample.player)
-            data.append((sample.state, sample.policy, value))
-        return data
+                logits, values = self.model(model_input)
 
+        legal = states.legal_move_mask()
 
-def _terminal_result(states: GPUChess, local_index: int) -> tuple[int, str, bool]:
-    """Return result/termination for one terminal GPU state."""
-    one = states.select(torch.tensor([local_index], device=states.device))
-    legal = one.legal_move_mask()[0]
-    in_check = bool(one.is_in_check()[0].item())
-    if not bool(legal.any().item()):
-        if in_check:
-            # Side to move has been checkmated.
-            result = -1 if bool(one.turn[0].item()) is False else 1
-            return result, "CHECKMATE", True
-        return 0, "STALEMATE", True
-    if bool((one.halfmove_clock[0] >= 100).item()):
-        return 0, "FIFTY_MOVE", True
-    if bool(one.insufficient_material()[0].item()):
-        return 0, "INSUFFICIENT_MATERIAL", True
-    return 0, "UNKNOWN", False
-
-
-def _play_games_gpu(
-    model,
-    num_games=8,
-    num_simulations=100,
-    max_moves=200,
-    temperature=1.0,
-    temperature_moves=20,
-    dirichlet_alpha=0.3,
-    dirichlet_epsilon=0.25,
-    batch_size=128,
-):
-    """GPU-resident self-play.
-
-    The hot path keeps boards, repetition history, training states, policies and
-    players on CUDA.  CPU is used only after a game finishes (or for final
-    checkpoint/replay serialization).  ``batch_size`` is retained for API
-    compatibility; MCTS receives the complete active batch.
-    """
-    if num_games <= 0:
-        return []
-    device = next(model.parameters()).device
-    if device.type != "cuda":
-        raise RuntimeError("GPU self-play requires a CUDA model")
-    _ = batch_size
-
-    states = GPUChess(device, num_games)
-    search = GPUMCTS(model=model, device=device)
-
-    # All per-move training information remains on the GPU.  0/1 board planes
-    # are stored as uint8 because they are exact and much smaller than float32.
-    sample_states = torch.empty(
-        (num_games, max_moves, 18, 8, 8), dtype=torch.uint8, device=device
-    )
-    sample_policies = torch.empty(
-        (num_games, max_moves, 4544), dtype=torch.float32, device=device
-    )
-    sample_players = torch.empty((num_games, max_moves), dtype=torch.int8, device=device)
-
-    move_numbers = torch.ones((num_games,), dtype=torch.int32, device=device)
-    active = torch.ones((num_games,), dtype=torch.bool, device=device)
-    result_tensor = torch.zeros((num_games,), dtype=torch.int8, device=device)
-    termination_code = torch.zeros((num_games,), dtype=torch.int8, device=device)
-    completed_tensor = torch.zeros((num_games,), dtype=torch.bool, device=device)
-
-    # Full repetition history on GPU.  This replaces state_hash().cpu().tolist()
-    # on every move and therefore removes a major synchronization point.
-    history = torch.empty((num_games, max_moves + 1), dtype=torch.int64, device=device)
-
-    # Codes: 1 checkmate, 2 stalemate, 3 fifty-move, 4 insufficient,
-    # 5 threefold, 6 max-moves, 7 unknown.
-    CODE_CHECKMATE = 1
-    CODE_STALEMATE = 2
-    CODE_FIFTY = 3
-    CODE_INSUFFICIENT = 4
-    CODE_THREEFOLD = 5
-    CODE_MAX_MOVES = 6
-    CODE_UNKNOWN = 7
-
-    # ------------------------------------------------------------------
-    # MCTS target diagnostics
-    # ------------------------------------------------------------------
-    # These statistics are diagnostic only. They do NOT change the MCTS
-    # search, move selection, or training targets.
-    diagnostic_positions = 0
-    diagnostic_entropy_sum = 0.0
-    diagnostic_normalized_entropy_sum = 0.0
-    diagnostic_max_prob_sum = 0.0
-    diagnostic_legal_moves_sum = 0.0
-    diagnostic_max_prob_bins = {
-        "<0.20": 0,
-        "0.20-0.40": 0,
-        "0.40-0.60": 0,
-        "0.60-0.80": 0,
-        ">=0.80": 0,
-    }
-
-    round_no = 0
-    while round_no < max_moves:
-        round_no += 1
-        active_idx = torch.nonzero(active, as_tuple=False).flatten()
-        if active_idx.numel() == 0:
-            break
-        active_states = states.select(active_idx)
-
-        # Repetition detection stays entirely on CUDA.
-        keys = active_states.state_hash()
-        history[active_idx, round_no - 1] = keys
-        previous = history[active_idx, :round_no]
-        repeated = (previous == keys[:, None]).sum(dim=1) >= 3
-        rep_local = torch.nonzero(repeated, as_tuple=False).flatten()
-        if rep_local.numel() > 0:
-            rep_global = active_idx[rep_local]
-            result_tensor[rep_global] = 0
-            termination_code[rep_global] = CODE_THREEFOLD
-            completed_tensor[rep_global] = True
-            active[rep_global] = False
-
-        active_idx = torch.nonzero(active, as_tuple=False).flatten()
-        if active_idx.numel() == 0:
-            continue
-        active_states = states.select(active_idx)
-
-        # Save the position BEFORE the selected move.  This is still entirely
-        # GPU-resident; no numpy/CPU conversion occurs here.
-        sample_pos = (move_numbers[active_idx] - 1).long()
-        model_input = active_states.to_model_input().to(torch.uint8)
-        sample_states[active_idx, sample_pos] = model_input
-        sample_players[active_idx, sample_pos] = (~active_states.turn).to(torch.int8).mul(2).sub(1)
-
-        search.search(
-            active_states,
-            num_simulations=num_simulations,
-            dirichlet_alpha=dirichlet_alpha,
-            dirichlet_epsilon=dirichlet_epsilon,
-            batch_size=batch_size,
+        return (
+            logits.float(),
+            values.squeeze(-1).float(),
+            legal,
         )
-        policies = search.root_visit_policy()
 
-        # --------------------------------------------------------------
-        # MCTS TARGET DIAGNOSTICS
-        # --------------------------------------------------------------
-        # root_visit_policy() is already a probability distribution over
-        # the 4544-action space.  We measure its concentration without
-        # changing the policy used for self-play.
-        with torch.no_grad():
-            eps = 1e-12
-            p = policies.clamp_min(eps)
-            entropy = -(policies * p.log()).sum(dim=1)
-            max_prob = policies.max(dim=1).values
+    def _expand(
+        self,
+        node_ids: torch.Tensor,
+        logits: torch.Tensor,
+        legal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expand a batch without GPU->CPU synchronization."""
 
-            # Exact legal-move count. This is diagnostic only and therefore
-            # intentionally kept out of the normal training logic.
-            legal_mask = active_states.legal_move_mask()
-            legal_count = legal_mask.sum(dim=1).to(torch.float32)
+        n = node_ids.numel()
 
-            # Normalize entropy by log(number of legal actions). A value
-            # near 1 means a very spread-out target; near 0 means highly
-            # concentrated.
-            normalized_entropy = entropy / legal_count.clamp_min(2.0).log()
+        if n == 0:
+            return torch.empty(
+                (0,),
+                dtype=torch.bool,
+                device=self.device,
+            )
 
-            n = int(policies.shape[0])
-            diagnostic_positions += n
-            diagnostic_entropy_sum += float(entropy.sum().item())
-            diagnostic_normalized_entropy_sum += float(normalized_entropy.sum().item())
-            diagnostic_max_prob_sum += float(max_prob.sum().item())
-            diagnostic_legal_moves_sum += float(legal_count.sum().item())
+        counts = legal.sum(
+            dim=1,
+            dtype=torch.int16,
+        )
 
-            diagnostic_max_prob_bins["<0.20"] += int((max_prob < 0.20).sum().item())
-            diagnostic_max_prob_bins["0.20-0.40"] += int(((max_prob >= 0.20) & (max_prob < 0.40)).sum().item())
-            diagnostic_max_prob_bins["0.40-0.60"] += int(((max_prob >= 0.40) & (max_prob < 0.60)).sum().item())
-            diagnostic_max_prob_bins["0.60-0.80"] += int(((max_prob >= 0.60) & (max_prob < 0.80)).sum().item())
-            diagnostic_max_prob_bins[">=0.80"] += int((max_prob >= 0.80).sum().item())
+        # Fixed-size legal action extraction.
+        #
+        # All legal actions are moved to the beginning of each row.
+        action_grid = self._action_ids[None, :].expand(
+            n,
+            -1,
+        )
 
-        current_temperature = temperature if round_no <= temperature_moves else 0.10
-        actions = search.select_actions(current_temperature)
-        next_states = search.advance(actions)
-        sample_policies[active_idx, sample_pos] = policies
+        ranked = torch.where(
+            legal,
+            action_grid,
+            torch.full_like(action_grid, 4544),
+        )
 
-        # Advance actual game states on CUDA.
-        states.pieces[active_idx] = next_states.pieces
-        states.turn[active_idx] = next_states.turn
-        states.castling[active_idx] = next_states.castling
-        states.ep_square[active_idx] = next_states.ep_square
-        states.halfmove_clock[active_idx] = next_states.halfmove_clock
-        states.fullmove_number[active_idx] = next_states.fullmove_number
-        move_numbers[active_idx] += 1
+        actions = torch.topk(
+            ranked,
+            k=self.max_children,
+            dim=1,
+            largest=False,
+            sorted=True,
+        ).values
 
-        # Terminal detection is batched on CUDA.  Only the small terminal index
-        # list is copied to CPU for constructing Python result objects.
-        terminal, terminal_value = next_states.terminal_info()
-        insufficient_all = next_states.insufficient_material()
-        fifty_all = next_states.halfmove_clock >= 100
-        # terminal_info already computed legal moves. Its value is -1 only for
-        # checkmate, so do not regenerate the expensive legal mask here.
-        checkmate_all = terminal & (terminal_value < 0)
-        stalemate_all = terminal & ~checkmate_all & ~fifty_all & ~insufficient_all
-        terminal_all = terminal | insufficient_all
-        term_local = torch.nonzero(terminal_all, as_tuple=False).flatten()
-        if term_local.numel() > 0:
-            checkmate = checkmate_all[term_local]
-            fifty = fifty_all[term_local]
-            insufficient = insufficient_all[term_local]
-            stalemate = stalemate_all[term_local]
-            term_code = torch.where(
-                checkmate,
-                torch.full_like(term_local, CODE_CHECKMATE, dtype=torch.int64),
-                torch.where(
-                    fifty,
-                    torch.full_like(term_local, CODE_FIFTY, dtype=torch.int64),
-                    torch.where(
-                        insufficient,
-                        torch.full_like(term_local, CODE_INSUFFICIENT, dtype=torch.int64),
-                        torch.where(
-                            stalemate,
-                            torch.full_like(term_local, CODE_STALEMATE, dtype=torch.int64),
-                            torch.full_like(term_local, CODE_UNKNOWN, dtype=torch.int64),
+        slots = self._child_cols[None, :]
+
+        valid = actions < 4544
+
+        edge_start = self.edge_used
+        reserved = n * self.max_children
+        edge_end = edge_start + reserved
+
+        if edge_end > self.max_edges:
+            raise RuntimeError(
+                "GPU MCTS edge pool exhausted; increase the search capacity."
+            )
+
+        edge_ids = self._edge_ids[
+            edge_start:edge_end
+        ].view(
+            n,
+            self.max_children,
+        )
+
+        child_nodes = self.num_games + edge_ids
+
+        self.edge_start[node_ids] = edge_ids[:, 0].to(torch.int32)
+
+        self.edge_count[node_ids] = counts
+
+        masked = logits.masked_fill(
+            ~legal,
+            torch.finfo(logits.dtype).min,
+        )
+
+        priors = torch.softmax(
+            masked,
+            dim=1,
+        )
+
+        priors = priors * legal.to(priors.dtype)
+
+        priors = priors / priors.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+        flat_valid = valid.reshape(-1)
+        flat_actions = actions.reshape(-1)
+        flat_edges = edge_ids.reshape(-1)
+        flat_children = child_nodes.reshape(-1)
+        flat_parents = (
+            node_ids[:, None]
+            .expand(-1, self.max_children)
+            .reshape(-1)
+        )
+
+        v_actions = flat_actions[flat_valid]
+        v_edges = flat_edges[flat_valid]
+        v_children = flat_children[flat_valid]
+        v_parents = flat_parents[flat_valid]
+
+        self.parent[v_children] = v_parents.to(torch.int32)
+
+        self.edge_child[v_edges] = v_children.to(torch.int32)
+
+        self.edge_action[v_edges] = v_actions.to(torch.int16)
+
+        prior_actions = actions.clamp_max(4543)
+
+        self.edge_prior[v_edges] = (
+            priors.gather(
+                1,
+                prior_actions,
+            )
+            .reshape(-1)[flat_valid]
+        )
+
+        self.edge_valid[
+            edge_ids.reshape(-1)
+        ] = valid.reshape(-1)
+
+        # Apply every valid child action as one GPU batch.
+        parent_states = self._state_view(v_parents)
+
+        child_states = parent_states.apply_actions_unchecked(
+            torch.arange(
+                v_actions.numel(),
+                device=self.device,
+                dtype=torch.long,
+            ),
+            v_actions,
+        )
+
+        self._write_states(
+            v_children,
+            child_states,
+        )
+
+        child_view = self._state_view(v_children)
+
+        draw_terminal = (
+            (child_view.halfmove_clock >= 100)
+            | child_view.insufficient_material()
+        )
+
+        self.terminal[v_children] = draw_terminal
+
+        self.expanded[node_ids] = True
+
+        self.terminal[node_ids] = counts == 0
+
+        self.edge_used = edge_end
+
+        return counts == 0
+
+    def _select_leaves(
+        self,
+        root_ids: torch.Tensor,
+        max_depth: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select one leaf per root in parallel and return leaf ids + paths."""
+
+        g = root_ids.numel()
+
+        current = root_ids.clone()
+
+        active = torch.ones(
+            (g,),
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        paths = torch.full(
+            (g, max_depth + 1),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        paths[:, 0] = root_ids.to(torch.int32)
+
+        depth = 0
+
+        while depth < max_depth:
+
+            selectable = (
+                active
+                & self.expanded[current]
+                & ~self.terminal[current]
+                & (self.edge_count[current] > 0)
+            )
+
+            sel_rows = torch.nonzero(
+                selectable,
+                as_tuple=False,
+            ).flatten()
+
+            if sel_rows.numel() == 0:
+                break
+
+            nodes = current[sel_rows]
+
+            starts = self.edge_start[nodes].to(torch.long)
+
+            counts = self.edge_count[nodes].to(torch.long)
+
+            arange_child = self._child_cols[None, :]
+
+            edge_idx = starts[:, None] + arange_child
+
+            edge_idx_safe = edge_idx.clamp(
+                0,
+                self.max_edges - 1,
+            )
+
+            valid = self.edge_valid[edge_idx_safe]
+
+            child = self.edge_child[
+                edge_idx_safe
+            ].to(torch.long)
+
+            visits = self.visit_count[child].float()
+
+            sums = self.value_sum[child]
+
+            q = torch.where(
+                visits > 0,
+                sums / visits,
+                torch.zeros_like(sums),
+            )
+
+            priors = self.edge_prior[edge_idx_safe]
+
+            parent_visits = (
+                self.visit_count[nodes]
+                .float()
+                .clamp_min(1.0)[:, None]
+            )
+
+            scores = (
+                -q
+                + self.c_puct
+                * priors
+                * torch.sqrt(parent_visits)
+                / (1.0 + visits)
+            )
+
+            scores = scores.masked_fill(
+                ~valid,
+                -torch.inf,
+            )
+
+            best = torch.argmax(
+                scores,
+                dim=1,
+            )
+
+            next_nodes = child.gather(
+                1,
+                best[:, None],
+            ).squeeze(1)
+
+            current[sel_rows] = next_nodes
+
+            depth += 1
+
+            paths[
+                sel_rows,
+                depth,
+            ] = next_nodes.to(torch.int32)
+
+            active = (
+                active
+                & self.expanded[current]
+                & ~self.terminal[current]
+            )
+
+        return (
+            current,
+            paths[:, :depth + 1],
+        )
+
+    def _backup(
+        self,
+        paths: torch.Tensor,
+        values: torch.Tensor,
+    ):
+        # Back up each root's path from leaf to root.
+        depth = paths.shape[1]
+
+        valid = paths >= 0
+
+        lengths = valid.sum(
+            dim=1,
+        )
+
+        d = torch.arange(
+            depth,
+            device=self.device,
+        )[None, :]
+
+        distance_from_leaf = (
+            lengths[:, None]
+            - 1
+            - d
+        )
+
+        use = valid
+
+        nodes = paths[use].to(torch.long)
+
+        signs = torch.where(
+            (distance_from_leaf[use] % 2) == 0,
+            torch.ones_like(
+                distance_from_leaf[use],
+                dtype=values.dtype,
+            ),
+            -torch.ones_like(
+                distance_from_leaf[use],
+                dtype=values.dtype,
+            ),
+        )
+
+        vv = (
+            values[:, None]
+            .expand(-1, depth)[use]
+            * signs
+        )
+
+        if nodes.numel():
+
+            self.visit_count.index_add_(
+                0,
+                nodes,
+                torch.ones(
+                    nodes.shape,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            )
+
+            self.value_sum.index_add_(
+                0,
+                nodes,
+                vv,
+            )
+
+    def _terminal_values(
+        self,
+        node_ids: torch.Tensor,
+    ) -> torch.Tensor:
+
+        states = self._state_view(node_ids)
+
+        legal = states.legal_move_mask()
+
+        no_moves = ~legal.any(dim=1)
+
+        check = states.is_in_check()
+
+        checkmate = no_moves & check
+
+        return torch.where(
+            checkmate,
+            -torch.ones_like(
+                states.halfmove_clock,
+                dtype=torch.float32,
+            ),
+            torch.zeros_like(
+                states.halfmove_clock,
+                dtype=torch.float32,
+            ),
+        )
+
+    def _apply_virtual_loss(
+        self,
+        paths: torch.Tensor,
+        loss: float = 1.0,
+    ):
+        """Temporarily reserve selected paths so parallel selections diverge."""
+
+        nodes = paths.reshape(-1).to(torch.long)
+
+        valid = nodes >= 0
+
+        nodes = nodes[valid]
+
+        if nodes.numel() == 0:
+            return
+
+        ones = torch.ones(
+            (nodes.numel(),),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        losses = torch.full(
+            (nodes.numel(),),
+            float(loss),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        self.visit_count.index_add_(
+            0,
+            nodes,
+            ones,
+        )
+
+        self.value_sum.index_add_(
+            0,
+            nodes,
+            losses,
+        )
+
+    def _remove_virtual_loss(
+        self,
+        paths: torch.Tensor,
+        loss: float = 1.0,
+    ):
+        nodes = paths.reshape(-1).to(torch.long)
+
+        valid = nodes >= 0
+
+        nodes = nodes[valid]
+
+        if nodes.numel() == 0:
+            return
+
+        ones = torch.ones(
+            (nodes.numel(),),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        losses = torch.full(
+            (nodes.numel(),),
+            -float(loss),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        self.visit_count.index_add_(
+            0,
+            nodes,
+            -ones,
+        )
+
+        self.value_sum.index_add_(
+            0,
+            nodes,
+            losses,
+        )
+
+    def _backup_batched(
+        self,
+        paths: torch.Tensor,
+        values: torch.Tensor,
+    ):
+        """GPU backup for [batch, games, depth] paths with variable lengths."""
+
+        b, g, depth = paths.shape
+
+        flat_paths = paths.reshape(
+            b * g,
+            depth,
+        )
+
+        flat_values = values.reshape(-1)
+
+        valid = flat_paths >= 0
+
+        lengths = valid.sum(
+            dim=1,
+        )
+
+        d = torch.arange(
+            depth,
+            device=self.device,
+        )[None, :]
+
+        distance_from_leaf = (
+            lengths[:, None]
+            - 1
+            - d
+        )
+
+        use = valid
+
+        nodes = flat_paths[use].to(torch.long)
+
+        base_values = (
+            flat_values[:, None]
+            .expand(-1, depth)[use]
+        )
+
+        signs = torch.where(
+            (distance_from_leaf[use] % 2) == 0,
+            torch.ones_like(base_values),
+            -torch.ones_like(base_values),
+        )
+
+        vv = base_values * signs
+
+        if nodes.numel():
+
+            self.visit_count.index_add_(
+                0,
+                nodes,
+                torch.ones(
+                    nodes.shape,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            )
+
+            self.value_sum.index_add_(
+                0,
+                nodes,
+                vv,
+            )
+
+    def search(
+        self,
+        root_states: GPUChess,
+        num_simulations: int,
+        dirichlet_alpha: float | None = None,
+        dirichlet_epsilon: float = 0.25,
+        batch_size: int = 4,
+    ):
+        """Run batched GPU MCTS.
+
+        A small number of simulations are selected with virtual loss before
+        neural-network evaluation. Their leaves are evaluated together in
+        a small CUDA batch.
+
+        Keeping this selection batch small prevents virtual loss from
+        accumulating across a large fraction of the search.
+        """
+
+        if root_states.device != self.device:
+            raise ValueError(
+                "root_states must live on the GPUMCTS device"
+            )
+
+        games = root_states.pieces.shape[0]
+
+        if games <= 0:
+            return
+
+        if num_simulations < 0:
+            raise ValueError(
+                "num_simulations must be non-negative"
+            )
+
+        # IMPORTANT:
+        #
+        # This batch_size is the number of MCTS simulations selected before
+        # neural-network evaluation.
+        #
+        # It is NOT the number of self-play games.
+        #
+        # Self-play may contain 128 games per GPU, but allowing 128 simulations
+        # to accumulate virtual loss before NN evaluation makes the search
+        # substantially different from sequential MCTS and can over-spread the
+        # root visit distribution.
+        #
+        # Keep this small even if the caller passes a large value.
+
+        MCTS_SELECTION_BATCH_SIZE = 4
+
+        batch_size = max(
+            1,
+            min(
+                int(batch_size),
+                MCTS_SELECTION_BATCH_SIZE,
+                int(num_simulations)
+                if num_simulations
+                else 1,
+            ),
+        )
+
+        self._allocate(
+            games,
+            max(1, num_simulations),
+        )
+
+        roots = self._root_ids
+
+        self.model.eval()
+
+        self._write_states(
+            roots,
+            root_states,
+        )
+
+        # Evaluate and expand root.
+        logits, _, legal = self._evaluate(
+            roots,
+        )
+
+        self._expand(
+            roots,
+            logits,
+            legal,
+        )
+
+        if dirichlet_alpha is not None:
+            self.add_dirichlet_noise(
+                dirichlet_alpha,
+                dirichlet_epsilon,
+            )
+
+        if num_simulations <= 0:
+            return
+
+        # Chess trees normally reach leaves well below this bound.
+        max_depth = 64
+
+        remaining = int(num_simulations)
+
+        while remaining > 0:
+
+            bsz = min(
+                batch_size,
+                remaining,
+            )
+
+            selected_paths = []
+            selected_leaves = []
+
+            # Select only a SMALL number of paths before evaluation.
+            #
+            # This is the important change. The self-play game batch can
+            # be 128, but the MCTS simulation batch stays at 4.
+            for _ in range(bsz):
+
+                leaves, paths = self._select_leaves(
+                    roots,
+                    max_depth=max_depth,
+                )
+
+                selected_leaves.append(
+                    leaves
+                )
+
+                selected_paths.append(
+                    paths
+                )
+
+                self._apply_virtual_loss(
+                    paths
+                )
+
+            # Normalize path depth for stacking without moving to CPU.
+            depth = max(
+                p.shape[1]
+                for p in selected_paths
+            )
+
+            padded = []
+
+            for p in selected_paths:
+
+                if p.shape[1] < depth:
+
+                    q = torch.full(
+                        (
+                            games,
+                            depth,
                         ),
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+
+                    q[:, :p.shape[1]] = p
+
+                    p = q
+
+                padded.append(p)
+
+            paths = torch.stack(
+                padded,
+                dim=0,
+            )
+
+            leaves = torch.stack(
+                selected_leaves,
+                dim=0,
+            )
+
+            # Remove temporary virtual losses before real backup.
+            self._remove_virtual_loss(
+                paths
+            )
+
+            flat_leaves = leaves.reshape(-1)
+
+            terminal = self.terminal[
+                flat_leaves
+            ]
+
+            values = torch.zeros(
+                (
+                    flat_leaves.numel(),
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+            # Terminal positions are evaluated without NN.
+            t_ids = flat_leaves[
+                terminal
+            ]
+
+            if t_ids.numel():
+
+                values[terminal] = (
+                    self._terminal_values(
+                        t_ids
+                    )
+                )
+
+            nt_mask = ~terminal
+
+            nt_ids = flat_leaves[
+                nt_mask
+            ]
+
+            if nt_ids.numel():
+
+                # Neural-network evaluation for the small batch.
+                logits, nn_values, legal = self._evaluate(
+                    nt_ids
+                )
+
+                self._expand(
+                    nt_ids,
+                    logits,
+                    legal,
+                )
+
+                no_moves = ~legal.any(
+                    dim=1
+                )
+
+                nt_view = self._state_view(
+                    nt_ids
+                )
+
+                check = nt_view.is_in_check()
+
+                exact = torch.where(
+                    no_moves & check,
+                    -torch.ones_like(
+                        nn_values
                     ),
+                    torch.zeros_like(
+                        nn_values
+                    ),
+                )
+
+                newly_terminal = (
+                    no_moves
+                    | (
+                        nt_view.halfmove_clock
+                        >= 100
+                    )
+                    | nt_view.insufficient_material()
+                )
+
+                values[nt_mask] = torch.where(
+                    newly_terminal,
+                    exact,
+                    nn_values,
+                )
+
+            self._backup_batched(
+                paths,
+                values.reshape(
+                    bsz,
+                    games,
                 ),
             )
-            term_turn = next_states.turn[term_local]
-            winner = torch.where(term_turn, torch.ones_like(term_local), -torch.ones_like(term_local))
-            term_result = torch.where(checkmate, winner, torch.zeros_like(term_local))
-            global_idx = active_idx[term_local]
-            result_tensor[global_idx] = term_result.to(torch.int8)
-            termination_code[global_idx] = term_code.to(torch.int8)
-            completed_tensor[global_idx] = True
-            active[global_idx] = False
 
-        # Progress: print every self-play round.
-        # flush=True makes the update appear immediately in Kaggle/terminal output.
-        print(
-            f"GPU self-play round {round_no} | "
-            f"active games: {int(active.sum().item())}/{num_games}",
-            flush=True,
+            remaining -= bsz
+
+    def root_policy(
+        self,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+
+        roots = self._root_ids
+
+        policy = torch.zeros(
+            (
+                self.num_games,
+                4544,
+            ),
+            dtype=torch.float32,
+            device=self.device,
         )
 
-    # Any game still active reached the move budget and is deliberately not
-    # converted into training data.
-    max_idx = torch.nonzero(active, as_tuple=False).flatten()
-    if max_idx.numel() > 0:
-        termination_code[max_idx] = CODE_MAX_MOVES
-        completed_tensor[max_idx] = False
-        active[max_idx] = False
+        starts = self.edge_start[
+            roots
+        ].to(torch.long)
 
-    # One CPU transfer per completed game, instead of one transfer per move.
-    result_cpu = result_tensor.detach().cpu().tolist()
-    code_cpu = termination_code.detach().cpu().tolist()
-    completed_cpu = completed_tensor.detach().cpu().tolist()
-    move_cpu = move_numbers.detach().cpu().tolist()
+        counts = self.edge_count[
+            roots
+        ].to(torch.long)
 
-    code_names = {
-        CODE_CHECKMATE: "CHECKMATE",
-        CODE_STALEMATE: "STALEMATE",
-        CODE_FIFTY: "FIFTY_MOVE",
-        CODE_INSUFFICIENT: "INSUFFICIENT_MATERIAL",
-        CODE_THREEFOLD: "THREEFOLD_REPETITION",
-        CODE_MAX_MOVES: "MAX_MOVES",
-        CODE_UNKNOWN: "UNKNOWN",
-    }
+        cols = self._child_cols[None, :]
 
-    results: list[Optional[SelfPlayResult]] = [None] * num_games
-    for gi in range(num_games):
-        completed = bool(completed_cpu[gi])
-        code = int(code_cpu[gi])
-        result = int(result_cpu[gi]) if completed else None
-        # A game that terminates before making a move has zero samples.  The
-        # number of stored positions is move_numbers-1, except for repetition
-        # which is checked before the move and therefore has the same count.
-        sample_count = max(0, int(move_cpu[gi]) - 1)
-        if completed and sample_count > 0:
-            s = sample_states[gi, :sample_count].detach().cpu().numpy().astype(np.float32, copy=False)
-            p = sample_policies[gi, :sample_count].detach().cpu().numpy()
-            pl = sample_players[gi, :sample_count].detach().cpu().numpy()
-            data = []
-            for j in range(sample_count):
-                player = int(pl[j])
-                if result == 0:
-                    value = 0.0
-                elif result == 1:
-                    value = float(player)
-                else:
-                    value = float(-player)
-                data.append((s[j], p[j], value))
-        else:
-            data = []
+        edge_idx = starts[:, None] + cols
 
-        results[gi] = SelfPlayResult(
-            training_data=data,
-            result=result,
-            termination=code_names.get(code, "UNKNOWN"),
-            moves_played=sample_count,
-            completed=completed,
+        safe = edge_idx.clamp(
+            0,
+            self.max_edges - 1,
         )
 
-    print("\\n" + "=" * 60)
-    print("GPU SELF-PLAY COMPLETE")
-    print("=" * 60)
-    for i, result in enumerate(results):
-        print(
-            f"Game {i + 1}: moves={result.moves_played} | "
-            f"result={result.result} | termination={result.termination} | "
-            f"completed={result.completed}"
-        )
-    total_samples = sum(len(r.training_data) for r in results if r is not None)
-    print("Training samples:", total_samples)
-
-    # --------------------------------------------------------------
-    # MCTS TARGET DIAGNOSTIC SUMMARY
-    # --------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("MCTS TARGET DIAGNOSTICS")
-    print("=" * 60)
-
-    if diagnostic_positions > 0:
-        print(f"Positions measured:           {diagnostic_positions:,}")
-        print(f"Average legal moves:          {diagnostic_legal_moves_sum / diagnostic_positions:.2f}")
-        print(f"Average policy entropy:       {diagnostic_entropy_sum / diagnostic_positions:.4f}")
-        print(f"Average normalized entropy:   {diagnostic_normalized_entropy_sum / diagnostic_positions:.4f}")
-        print(f"Average max visit probability:{diagnostic_max_prob_sum / diagnostic_positions:.4f}")
-        print("\nMax visit probability distribution:")
-        for label, count in diagnostic_max_prob_bins.items():
-            pct = 100.0 * count / diagnostic_positions
-            print(f"  {label:>8}: {count:7,} ({pct:6.2f}%)")
-    else:
-        print("No MCTS diagnostic positions were collected.")
-
-    print("=" * 60)
-
-    return results
-
-
-
-def _multi_gpu_self_play_worker(
-    rank: int,
-    device_id: int,
-    num_games: int,
-    checkpoint_path: str,
-    output_path: str,
-    num_simulations: int,
-    max_moves: int,
-    temperature: float,
-    temperature_moves: int,
-    dirichlet_alpha: float,
-    dirichlet_epsilon: float,
-    batch_size: int,
-    seed: int,
-):
-    """Run one independent self-play shard on one CUDA device.
-
-    Each worker owns its model, GPU chess state and MCTS tree. Results are
-    written to a temporary file instead of being sent through multiprocessing
-    IPC, because completed self-play data contains large 4544-action policies.
-    """
-    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-    torch.cuda.set_device(device_id)
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    from model.chess_net import ChessNet
-    from environment.action_encoder import ActionEncoder
-
-    encoder = ActionEncoder()
-    model = ChessNet(action_space_size=encoder.size()).to(
-        torch.device(f"cuda:{device_id}")
-    )
-    model.to(memory_format=torch.channels_last)
-
-    checkpoint = torch.load(
-        checkpoint_path, map_location="cpu", weights_only=False
-    )
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    print(
-        f"[Self-play worker {rank}] GPU {device_id}: "
-        f"{torch.cuda.get_device_name(device_id)} | games={num_games}",
-        flush=True,
-    )
-
-    results = play_games(
-        model=model,
-        num_games=num_games,
-        num_simulations=num_simulations,
-        max_moves=max_moves,
-        temperature=temperature,
-        temperature_moves=temperature_moves,
-        dirichlet_alpha=dirichlet_alpha,
-        dirichlet_epsilon=dirichlet_epsilon,
-        batch_size=batch_size,
-    )
-
-    torch.save(results, output_path)
-    print(
-        f"[Self-play worker {rank}] finished and saved {len(results)} games",
-        flush=True,
-    )
-
-
-def play_games_multi_gpu(
-    model,
-    checkpoint_path,
-    num_games=8,
-    num_simulations=100,
-    max_moves=200,
-    temperature=1.0,
-    temperature_moves=20,
-    dirichlet_alpha=0.3,
-    dirichlet_epsilon=0.25,
-    batch_size=128,
-    seed=42,
-):
-    """Split self-play across all visible CUDA GPUs.
-
-    The parent process does not run MCTS. One spawned process is created per
-    GPU, and each process runs an independent half/batch of the games. This
-    targets the expensive self-play stage only; neural-network training remains
-    unchanged in the parent process.
-    """
-    if num_games <= 0:
-        return []
-
-    if next(model.parameters()).device.type != "cuda":
-        return play_games(
-            model=model,
-            num_games=num_games,
-            num_simulations=num_simulations,
-            max_moves=max_moves,
-            temperature=temperature,
-            temperature_moves=temperature_moves,
-            dirichlet_alpha=dirichlet_alpha,
-            dirichlet_epsilon=dirichlet_epsilon,
-            batch_size=batch_size,
-        )
-
-    gpu_count = torch.cuda.device_count()
-    if gpu_count < 2:
-        return play_games(
-            model=model,
-            num_games=num_games,
-            num_simulations=num_simulations,
-            max_moves=max_moves,
-            temperature=temperature,
-            temperature_moves=temperature_moves,
-            dirichlet_alpha=dirichlet_alpha,
-            dirichlet_epsilon=dirichlet_epsilon,
-            batch_size=batch_size,
-        )
-
-    # Use every visible GPU. For your current 2-GPU setup this becomes
-    # 128 games on GPU 0 + 128 games on GPU 1 when num_games=256.
-    workers = min(gpu_count, num_games)
-    game_counts = [num_games // workers] * workers
-    for i in range(num_games % workers):
-        game_counts[i] += 1
-
-    checkpoint_path = os.path.abspath(os.fspath(checkpoint_path))
-    temp_dir = tempfile.mkdtemp(prefix="chess_selfplay_multi_gpu_")
-    ctx = mp.get_context("spawn")
-    processes = []
-    output_paths = []
-
-    try:
-        print("\nMULTI-GPU SELF-PLAY", flush=True)
-        print(f"Visible GPUs: {gpu_count}", flush=True)
-        print(f"Self-play workers: {workers}", flush=True)
-        print(f"Games per GPU: {game_counts}", flush=True)
-
-        # Free the parent's model VRAM while workers run. The model is moved
-        # back to CUDA by rl_training.py after self-play for the fast training
-        # phase.
-        model.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        for rank, (device_id, worker_games) in enumerate(enumerate(game_counts)):
-            output_path = os.path.join(temp_dir, f"worker_{rank}.pt")
-            output_paths.append(output_path)
-            process = ctx.Process(
-                target=_multi_gpu_self_play_worker,
-                args=(
-                    rank,
-                    device_id,
-                    worker_games,
-                    checkpoint_path,
-                    output_path,
-                    num_simulations,
-                    max_moves,
-                    temperature,
-                    temperature_moves,
-                    dirichlet_alpha,
-                    dirichlet_epsilon,
-                    batch_size,
-                    seed + rank,
-                ),
-            )
-            process.start()
-            processes.append(process)
-
-        for process in processes:
-            process.join()
-
-        failed = [
-            (rank, process.exitcode)
-            for rank, process in enumerate(processes)
-            if process.exitcode != 0
+        valid = self.edge_valid[
+            safe
         ]
-        if failed:
-            raise RuntimeError(f"Multi-GPU self-play worker failure: {failed}")
 
-        results = []
-        for output_path in output_paths:
-            worker_results = torch.load(
-                output_path, map_location="cpu", weights_only=False
+        actions = self.edge_action[
+            safe
+        ].to(torch.long)
+
+        visits = self.visit_count[
+            self.edge_child[
+                safe
+            ].to(torch.long)
+        ].float()
+
+        if temperature <= 0:
+
+            weights = visits
+
+            best = torch.argmax(
+                weights.masked_fill(
+                    ~valid,
+                    -1,
+                ),
+                dim=1,
             )
-            results.extend(worker_results)
 
-        print(
-            f"MULTI-GPU SELF-PLAY COMPLETE: {len(results)} games",
-            flush=True,
-        )
-        return results
-    finally:
-        # Restore the parent's model to its original CUDA device so the
-        # existing training code can continue unchanged.
-        original_device = next(model.parameters()).device
-        if original_device.type == "cpu":
-            model.to("cuda:0")
-            model.to(memory_format=torch.channels_last)
-        shutil.rmtree(temp_dir, ignore_errors=True)
+            chosen = actions[
+                torch.arange(
+                    self.num_games,
+                    device=self.device,
+                ),
+                best,
+            ]
 
-def play_games(
-    model,
-    num_games=8,
-    num_simulations=100,
-    max_moves=200,
-    temperature=1.0,
-    temperature_moves=20,
-    dirichlet_alpha=0.3,
-    dirichlet_epsilon=0.25,
-    batch_size=128,
-):
-    """Run GPU-native self-play when the model is CUDA; otherwise use legacy path."""
-    if next(model.parameters()).device.type == "cuda":
-        return _play_games_gpu(
-            model=model,
-            num_games=num_games,
-            num_simulations=num_simulations,
-            max_moves=max_moves,
-            temperature=temperature,
-            temperature_moves=temperature_moves,
-            dirichlet_alpha=dirichlet_alpha,
-            dirichlet_epsilon=dirichlet_epsilon,
-            batch_size=batch_size,
+            policy.scatter_(
+                1,
+                chosen[:, None],
+                torch.ones_like(
+                    chosen[:, None],
+                    dtype=policy.dtype,
+                ),
+            )
+
+            return policy
+
+        weights = torch.where(
+            valid,
+            visits.clamp_min(0.0).pow(
+                1.0 / temperature
+            ),
+            torch.zeros_like(visits),
         )
 
-    # CPU fallback imports are lazy so CUDA runs never import python-chess.
-    from training.self_play_legacy import play_games as legacy_play_games
-    return legacy_play_games(
-        model=model,
-        num_games=num_games,
-        num_simulations=num_simulations,
-        max_moves=max_moves,
-        temperature=temperature,
-        temperature_moves=temperature_moves,
-        dirichlet_alpha=dirichlet_alpha,
-        dirichlet_epsilon=dirichlet_epsilon,
-        batch_size=batch_size,
-    )
+        denom = weights.sum(
+            dim=1,
+            keepdim=True,
+        )
 
+        probs = weights / denom.clamp_min(
+            1e-12
+        )
 
-def play_game(
-    model,
-    num_simulations=100,
-    max_moves=200,
-    temperature=1.0,
-    temperature_moves=20,
-    dirichlet_alpha=0.3,
-    dirichlet_epsilon=0.25,
-    batch_size=128,
-):
-    return play_games(
-        model=model,
-        num_games=1,
-        num_simulations=num_simulations,
-        max_moves=max_moves,
-        temperature=temperature,
-        temperature_moves=temperature_moves,
-        dirichlet_alpha=dirichlet_alpha,
-        dirichlet_epsilon=dirichlet_epsilon,
-        batch_size=batch_size,
-    )[0]
+        rows = (
+            torch.arange(
+                self.num_games,
+                device=self.device,
+            )[:, None]
+            .expand_as(actions)
+        )
+
+        policy.scatter_add_(
+            1,
+            actions,
+            torch.where(
+                valid,
+                probs,
+                torch.zeros_like(probs),
+            ),
+        )
+
+        return policy
+
+    def select_actions(
+        self,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+
+        roots = self._root_ids
+
+        starts = self.edge_start[
+            roots
+        ].to(torch.long)
+
+        counts = self.edge_count[
+            roots
+        ].to(torch.long)
+
+        cols = self._child_cols[None, :]
+
+        edge_idx = starts[:, None] + cols
+
+        safe = edge_idx.clamp(
+            0,
+            self.max_edges - 1,
+        )
+
+        valid = self.edge_valid[
+            safe
+        ]
+
+        actions = self.edge_action[
+            safe
+        ].to(torch.long)
+
+        visits = self.visit_count[
+            self.edge_child[
+                safe
+            ].to(torch.long)
+        ].float()
+
+        if temperature <= 0:
+
+            return actions.gather(
+                1,
+                torch.argmax(
+                    visits.masked_fill(
+                        ~valid,
+                        -1,
+                    ),
+                    dim=1,
+                    keepdim=True,
+                ),
+            ).squeeze(1)
+
+        weights = torch.where(
+            valid,
+            visits.clamp_min(0).pow(
+                1.0 / temperature
+            ),
+            torch.zeros_like(visits),
+        )
+
+        probs = weights / weights.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+        return actions.gather(
+            1,
+            torch.multinomial(
+                probs,
+                1,
+            ),
+        ).squeeze(1)
+
+    def add_dirichlet_noise(
+        self,
+        alpha: float = 0.3,
+        epsilon: float = 0.25,
+    ):
+
+        if alpha <= 0 or not 0 <= epsilon <= 1:
+            raise ValueError(
+                "Invalid Dirichlet parameters"
+            )
+
+        roots = self._root_ids
+
+        starts = self.edge_start[
+            roots
+        ].to(torch.long)
+
+        counts = self.edge_count[
+            roots
+        ].to(torch.long)
+
+        maxc = self.max_children
+
+        cols = self._child_cols[None, :]
+
+        edge_idx = starts[:, None] + cols
+
+        e = edge_idx.clamp(
+            0,
+            self.max_edges - 1,
+        )
+
+        valid = self.edge_valid[e]
+
+        # Independent Dirichlet distribution for each root.
+        noise = torch.distributions.Dirichlet(
+            torch.full(
+                (
+                    maxc,
+                ),
+                alpha,
+                device=self.device,
+            )
+        ).sample(
+            (
+                self.num_games,
+            )
+        )
+
+        noise = noise * valid.float()
+
+        noise = noise / noise.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+        old = self.edge_prior[e]
+
+        self.edge_prior[e] = torch.where(
+            valid,
+            (1 - epsilon) * old
+            + epsilon * noise,
+            old,
+        )
+
+    def root_visit_policy(
+        self,
+    ) -> torch.Tensor:
+        """Return normalized root visit counts over all 4544 actions."""
+
+        roots = self._root_ids
+
+        starts = self.edge_start[
+            roots
+        ].to(torch.long)
+
+        counts = self.edge_count[
+            roots
+        ].to(torch.long)
+
+        cols = self._child_cols[None, :]
+
+        edge_idx = starts[:, None] + cols
+
+        safe = edge_idx.clamp(
+            0,
+            self.max_edges - 1,
+        )
+
+        valid = self.edge_valid[
+            safe
+        ]
+
+        actions = self.edge_action[
+            safe
+        ].to(torch.long)
+
+        visits = self.visit_count[
+            self.edge_child[
+                safe
+            ].to(torch.long)
+        ].float()
+
+        visits = torch.where(
+            valid,
+            visits,
+            torch.zeros_like(visits),
+        )
+
+        probs = visits / visits.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+        policy = torch.zeros(
+            (
+                self.num_games,
+                4544,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        policy.scatter_add_(
+            1,
+            actions,
+            probs,
+        )
+
+        return policy
+
+    def advance(
+        self,
+        actions: torch.Tensor,
+    ) -> GPUChess:
+        """Return GPU states reached by one selected action per root."""
+
+        actions = actions.to(
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        roots = self._root_ids
+
+        starts = self.edge_start[
+            roots
+        ].to(torch.long)
+
+        counts = self.edge_count[
+            roots
+        ].to(torch.long)
+
+        cols = self._child_cols[None, :]
+
+        edge_idx = starts[:, None] + cols
+
+        safe = edge_idx.clamp(
+            0,
+            self.max_edges - 1,
+        )
+
+        valid = self.edge_valid[
+            safe
+        ]
+
+        edge_actions = self.edge_action[
+            safe
+        ].to(torch.long)
+
+        matches = (
+            edge_actions == actions[:, None]
+        ) & valid
+
+        pos = torch.argmax(
+            matches.to(torch.int8),
+            dim=1,
+        )
+
+        child_ids = self.edge_child[
+            safe.gather(
+                1,
+                pos[:, None],
+            ).squeeze(1)
+        ].to(torch.long)
+
+        return self._state_view(
+            child_ids
+        )
+
+    def get_child_states(self) -> GPUChess:
+
+        roots = self._root_ids
+
+        actions = self.select_actions(
+            temperature=0.0
+        )
+
+        root_starts = self.edge_start[
+            roots
+        ].to(torch.long)
+
+        root_counts = self.edge_count[
+            roots
+        ].to(torch.long)
+
+        cols = self._child_cols[None, :]
+
+        edge_idx = (
+            root_starts[:, None]
+            + cols
+        )
+
+        safe = edge_idx.clamp(
+            0,
+            self.max_edges - 1,
+        )
+
+        valid = self.edge_valid[
+            safe
+        ]
+
+        edge_actions = self.edge_action[
+            safe
+        ].to(torch.long)
+
+        chosen_pos = (
+            edge_actions
+            == actions[:, None]
+        ) & valid
+
+        chosen_edge = torch.argmax(
+            chosen_pos.to(torch.int8),
+            dim=1,
+        )
+
+        child_ids = self.edge_child[
+            safe.gather(
+                1,
+                chosen_edge[:, None],
+            ).squeeze(1)
+        ].to(torch.long)
+
+        return self._state_view(
+            child_ids
+        )
+
+    def root_children(self):
+
+        roots = self._root_ids
+
+        starts = self.edge_start[
+            roots
+        ].to(torch.long)
+
+        counts = self.edge_count[
+            roots
+        ].to(torch.long)
+
+        cols = self._child_cols[None, :]
+
+        edge_idx = starts[:, None] + cols
+
+        safe = edge_idx.clamp(
+            0,
+            self.max_edges - 1,
+        )
+
+        valid = self.edge_valid[
+            safe
+        ]
+
+        actions = self.edge_action[
+            safe
+        ].to(torch.long)
+
+        visits = self.visit_count[
+            self.edge_child[
+                safe
+            ].to(torch.long)
+        ].float()
+
+        return (
+            actions,
+            visits,
+            valid,
+        )
