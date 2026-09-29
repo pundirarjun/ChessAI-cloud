@@ -141,6 +141,24 @@ def _play_games_gpu(
     CODE_MAX_MOVES = 6
     CODE_UNKNOWN = 7
 
+    # ------------------------------------------------------------------
+    # MCTS target diagnostics
+    # ------------------------------------------------------------------
+    # These statistics are diagnostic only. They do NOT change the MCTS
+    # search, move selection, or training targets.
+    diagnostic_positions = 0
+    diagnostic_entropy_sum = 0.0
+    diagnostic_normalized_entropy_sum = 0.0
+    diagnostic_max_prob_sum = 0.0
+    diagnostic_legal_moves_sum = 0.0
+    diagnostic_max_prob_bins = {
+        "<0.20": 0,
+        "0.20-0.40": 0,
+        "0.40-0.60": 0,
+        "0.60-0.80": 0,
+        ">=0.80": 0,
+    }
+
     round_no = 0
     while round_no < max_moves:
         round_no += 1
@@ -182,6 +200,42 @@ def _play_games_gpu(
             batch_size=batch_size,
         )
         policies = search.root_visit_policy()
+
+        # --------------------------------------------------------------
+        # MCTS TARGET DIAGNOSTICS
+        # --------------------------------------------------------------
+        # root_visit_policy() is already a probability distribution over
+        # the 4544-action space.  We measure its concentration without
+        # changing the policy used for self-play.
+        with torch.no_grad():
+            eps = 1e-12
+            p = policies.clamp_min(eps)
+            entropy = -(policies * p.log()).sum(dim=1)
+            max_prob = policies.max(dim=1).values
+
+            # Exact legal-move count. This is diagnostic only and therefore
+            # intentionally kept out of the normal training logic.
+            legal_mask = active_states.legal_move_mask()
+            legal_count = legal_mask.sum(dim=1).to(torch.float32)
+
+            # Normalize entropy by log(number of legal actions). A value
+            # near 1 means a very spread-out target; near 0 means highly
+            # concentrated.
+            normalized_entropy = entropy / legal_count.clamp_min(2.0).log()
+
+            n = int(policies.shape[0])
+            diagnostic_positions += n
+            diagnostic_entropy_sum += float(entropy.sum().item())
+            diagnostic_normalized_entropy_sum += float(normalized_entropy.sum().item())
+            diagnostic_max_prob_sum += float(max_prob.sum().item())
+            diagnostic_legal_moves_sum += float(legal_count.sum().item())
+
+            diagnostic_max_prob_bins["<0.20"] += int((max_prob < 0.20).sum().item())
+            diagnostic_max_prob_bins["0.20-0.40"] += int(((max_prob >= 0.20) & (max_prob < 0.40)).sum().item())
+            diagnostic_max_prob_bins["0.40-0.60"] += int(((max_prob >= 0.40) & (max_prob < 0.60)).sum().item())
+            diagnostic_max_prob_bins["0.60-0.80"] += int(((max_prob >= 0.60) & (max_prob < 0.80)).sum().item())
+            diagnostic_max_prob_bins[">=0.80"] += int((max_prob >= 0.80).sum().item())
+
         current_temperature = temperature if round_no <= temperature_moves else 0.10
         actions = search.select_actions(current_temperature)
         next_states = search.advance(actions)
@@ -313,7 +367,31 @@ def _play_games_gpu(
             f"result={result.result} | termination={result.termination} | "
             f"completed={result.completed}"
         )
-    print("Training samples:", sum(len(r.training_data) for r in results if r is not None))
+    total_samples = sum(len(r.training_data) for r in results if r is not None)
+    print("Training samples:", total_samples)
+
+    # --------------------------------------------------------------
+    # MCTS TARGET DIAGNOSTIC SUMMARY
+    # --------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("MCTS TARGET DIAGNOSTICS")
+    print("=" * 60)
+
+    if diagnostic_positions > 0:
+        print(f"Positions measured:           {diagnostic_positions:,}")
+        print(f"Average legal moves:          {diagnostic_legal_moves_sum / diagnostic_positions:.2f}")
+        print(f"Average policy entropy:       {diagnostic_entropy_sum / diagnostic_positions:.4f}")
+        print(f"Average normalized entropy:   {diagnostic_normalized_entropy_sum / diagnostic_positions:.4f}")
+        print(f"Average max visit probability:{diagnostic_max_prob_sum / diagnostic_positions:.4f}")
+        print("\nMax visit probability distribution:")
+        for label, count in diagnostic_max_prob_bins.items():
+            pct = 100.0 * count / diagnostic_positions
+            print(f"  {label:>8}: {count:7,} ({pct:6.2f}%)")
+    else:
+        print("No MCTS diagnostic positions were collected.")
+
+    print("=" * 60)
+
     return results
 
 
