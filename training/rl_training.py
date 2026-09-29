@@ -52,12 +52,12 @@ from training.train_step import train_from_replay_buffer
 # Iteration / paths
 # ---------------------------------------------------------------------------
 
-RL_ITERATION = 50
+RL_ITERATION = 51
 
 PREVIOUS_ITERATION = RL_ITERATION - 1
 
 KAGGLE_CHECKPOINT_ROOT = (
-    "/kaggle/working/chess-zero/checkpoints"
+    "/kaggle/input/datasets/arjunthakur9999/checkpoints/chess_checkpoints (3)"
 )
 
 LOCAL_CHECKPOINT_ROOT = "checkpoints"
@@ -112,7 +112,7 @@ REPLAY_BUFFER_CAPACITY = 150000
 
 TRAINING_BATCH_SIZE = 256
 
-TRAINING_STEPS = 600
+TRAINING_STEPS = 1200
 
 LEARNING_RATE = 5e-5
 
