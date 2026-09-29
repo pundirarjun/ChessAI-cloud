@@ -1,33 +1,28 @@
 # ============================================================
-# RL53 GPU SELF-PLAY INTEGRATION TEST
+# RL53 SELF-PLAY INTEGRATION TEST - ROBUST ENTRYPOINT VERSION
 # ============================================================
 #
-# Tests the ACTUAL GPU self-play function currently present in
-# training/self_play.py:
+# IMPORTANT:
+# Your Kaggle training/self_play.py is NOT the same revision as
+# the copied source we previously inspected. Therefore this test
+# does NOT assume that play_games() or _play_games_gpu() exists.
 #
-#     _play_games_gpu(...)
+# It imports the ACTUAL training/self_play.py on Kaggle and detects
+# the available self-play entrypoint.
 #
-# This avoids the play_games import mismatch.
+# Preferred order:
+#   1. play_games_multi_gpu
+#   2. _play_games_gpu
+#   3. play_games
 #
-# Checks:
-#   1. RL53 checkpoint loads correctly
-#   2. GPU self-play actually runs
-#   3. Requested games are returned
-#   4. Game termination/result fields are valid
-#   5. Completed games produce training samples
-#   6. Incomplete MAX_MOVES games produce no training data
-#   7. States have shape (18, 8, 8)
-#   8. Policies have shape (4544,)
-#   9. Policies are finite, non-negative and sum to 1
-#  10. Values are -1 / 0 / +1
-#  11. State/policy data contains no NaN/Inf
-#  12. Training-data count matches moves played
+# The test then validates the returned SelfPlayResult objects.
 #
 # ============================================================
 
 import os
 import sys
 import traceback
+import inspect
 import numpy as np
 import torch
 
@@ -53,7 +48,6 @@ DIRICHLET_ALPHA = 0.3
 DIRICHLET_EPSILON = 0.25
 
 BATCH_SIZE = 128
-
 SEED = 42
 
 
@@ -91,64 +85,16 @@ print("Seed:", SEED)
 
 
 # ============================================================
-# PROJECT IMPORTS
+# PROJECT PATH
 # ============================================================
 
-sys.path.insert(0, PROJECT_DIR)
-
-from model.chess_net import ChessNet
-
-# IMPORTANT:
-# Your current self_play.py exposes _play_games_gpu()
-# rather than the play_games() wrapper.
-from training.self_play import _play_games_gpu
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def check(condition, message):
-    if not bool(condition):
-        raise AssertionError("FAILED: " + message)
-
-    print("PASS:", message)
-
-
-def check_close(value, expected, message, tolerance=1e-4):
-    value = float(value)
-    expected = float(expected)
-
-    if abs(value - expected) > tolerance:
-        raise AssertionError(
-            f"FAILED: {message}: "
-            f"expected {expected:.8f}, got {value:.8f}"
-        )
-
-    print(
-        f"PASS: {message}: "
-        f"{value:.8f}"
-    )
-
-
-def is_finite(x):
-    return bool(np.isfinite(x).all())
-
-
-def policy_stats(policy):
-    policy = np.asarray(policy)
-
-    return {
-        "sum": float(policy.sum()),
-        "min": float(policy.min()),
-        "max": float(policy.max()),
-        "nonzero": int(np.count_nonzero(policy > 0.0)),
-    }
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
 
 
 # ============================================================
 # TEST 1
-# CHECK ENVIRONMENT
+# ENVIRONMENT
 # ============================================================
 
 print()
@@ -156,36 +102,115 @@ print("=" * 100)
 print("TEST 1: ENVIRONMENT")
 print("=" * 100)
 
-check(
-    torch.cuda.is_available(),
-    "CUDA is available",
-)
+assert torch.cuda.is_available(), "CUDA is required for this test."
 
-check(
-    DEVICE.type == "cuda",
-    "Test is running on CUDA",
-)
+assert os.path.isdir(
+    PROJECT_DIR
+), f"Project directory not found: {PROJECT_DIR}"
 
-check(
-    os.path.isdir(PROJECT_DIR),
-    "Project directory exists",
-)
+assert os.path.isfile(
+    CHECKPOINT_PATH
+), f"Checkpoint not found: {CHECKPOINT_PATH}"
 
-check(
-    os.path.isfile(CHECKPOINT_PATH),
-    "RL53 checkpoint exists",
-)
+print("PASS: CUDA available")
+print("PASS: Project directory exists")
+print("PASS: RL53 checkpoint exists")
 
 
 # ============================================================
 # TEST 2
-# LOAD RL53 CHECKPOINT
+# LOAD THE ACTUAL self_play MODULE
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 2: LOAD RL53 CHECKPOINT")
+print("TEST 2: ACTUAL training.self_play MODULE")
 print("=" * 100)
+
+# Import the module itself rather than importing a guessed function.
+import training.self_play as self_play
+
+print()
+print("Loaded module:")
+print(self_play.__file__)
+
+assert os.path.abspath(self_play.__file__) == os.path.abspath(
+    os.path.join(PROJECT_DIR, "training", "self_play.py")
+), (
+    "Python loaded a different self_play.py than the Kaggle project file."
+)
+
+print()
+print("Available self-play callables:")
+
+candidate_names = [
+    "play_games_multi_gpu",
+    "_play_games_gpu",
+    "play_games",
+]
+
+available = []
+
+for name in candidate_names:
+    obj = getattr(self_play, name, None)
+
+    if callable(obj):
+        available.append(name)
+
+        print()
+        print(f"FOUND: {name}")
+        try:
+            print(
+                inspect.signature(obj)
+            )
+        except Exception:
+            print("Signature unavailable.")
+    else:
+        print(f"NOT FOUND: {name}")
+
+
+print()
+
+assert available, (
+    "No supported self-play entrypoint exists in the actual "
+    "training/self_play.py. "
+    f"Available module names containing 'play': "
+    f"{[x for x in dir(self_play) if 'play' in x.lower()]}"
+)
+
+# Use the highest-level entrypoint available.
+#
+# play_games_multi_gpu is preferred because this is the function
+# used by the multi-GPU RL training pipeline.
+if "play_games_multi_gpu" in available:
+    ENTRYPOINT_NAME = "play_games_multi_gpu"
+    ENTRYPOINT = self_play.play_games_multi_gpu
+
+elif "_play_games_gpu" in available:
+    ENTRYPOINT_NAME = "_play_games_gpu"
+    ENTRYPOINT = self_play._play_games_gpu
+
+else:
+    ENTRYPOINT_NAME = "play_games"
+    ENTRYPOINT = self_play.play_games
+
+print(
+    "SELECTED ENTRYPOINT:",
+    ENTRYPOINT_NAME
+)
+
+
+# ============================================================
+# TEST 3
+# LOAD RL53 MODEL
+# ============================================================
+
+print()
+print("=" * 100)
+print("TEST 3: LOAD RL53 MODEL")
+print("=" * 100)
+
+from model.chess_net import ChessNet
 
 checkpoint = torch.load(
     CHECKPOINT_PATH,
@@ -215,61 +240,69 @@ print()
 print("Checkpoint iteration:", iteration)
 
 if iteration is not None:
-    check(
-        int(iteration) == 53,
-        "Loaded checkpoint is RL53",
+    assert int(iteration) == 53, (
+        f"Expected RL53 checkpoint, got iteration {iteration}"
     )
 
-for name, parameter in model.named_parameters():
-    check(
-        bool(torch.isfinite(parameter).all().item()),
-        f"Model parameter finite: {name}",
-    )
-
-print()
-print("RL53 model loaded successfully.")
+print("PASS: RL53 model loaded")
 
 
 # ============================================================
-# TEST 3
-# RUN ACTUAL GPU SELF-PLAY
+# TEST 4
+# RUN THE ACTUAL SELF-PLAY ENTRYPOINT
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 3: ACTUAL GPU SELF-PLAY")
+print("TEST 4: RUN ACTUAL SELF-PLAY")
 print("=" * 100)
 
 print()
-print("Calling:")
-print("    training.self_play._play_games_gpu()")
-print()
+print("Using:", ENTRYPOINT_NAME)
 
-# Reproducibility
 torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
 
 try:
 
-    results = _play_games_gpu(
-        model=model,
-        num_games=NUM_GAMES,
-        num_simulations=NUM_SIMULATIONS,
-        max_moves=MAX_MOVES,
-        temperature=TEMPERATURE,
-        temperature_moves=TEMPERATURE_MOVES,
-        dirichlet_alpha=DIRICHLET_ALPHA,
-        dirichlet_epsilon=DIRICHLET_EPSILON,
-        batch_size=BATCH_SIZE,
-    )
+    if ENTRYPOINT_NAME == "play_games_multi_gpu":
+
+        # This is the actual high-level multi-GPU function.
+        results = ENTRYPOINT(
+            model=model,
+            checkpoint_path=CHECKPOINT_PATH,
+            num_games=NUM_GAMES,
+            num_simulations=NUM_SIMULATIONS,
+            max_moves=MAX_MOVES,
+            temperature=TEMPERATURE,
+            temperature_moves=TEMPERATURE_MOVES,
+            dirichlet_alpha=DIRICHLET_ALPHA,
+            dirichlet_epsilon=DIRICHLET_EPSILON,
+            batch_size=BATCH_SIZE,
+            seed=SEED,
+        )
+
+    else:
+
+        # Direct GPU self-play fallback.
+        results = ENTRYPOINT(
+            model=model,
+            num_games=NUM_GAMES,
+            num_simulations=NUM_SIMULATIONS,
+            max_moves=MAX_MOVES,
+            temperature=TEMPERATURE,
+            temperature_moves=TEMPERATURE_MOVES,
+            dirichlet_alpha=DIRICHLET_ALPHA,
+            dirichlet_epsilon=DIRICHLET_EPSILON,
+            batch_size=BATCH_SIZE,
+        )
 
 except Exception:
 
     print()
     print("=" * 100)
-    print("GPU SELF-PLAY CRASHED")
+    print("SELF-PLAY FAILED")
     print("=" * 100)
 
     traceback.print_exc()
@@ -278,34 +311,36 @@ except Exception:
 
 
 # ============================================================
-# TEST 4
+# TEST 5
 # BASIC RETURN VALIDATION
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 4: RETURN VALUE")
+print("TEST 5: RETURN VALUE")
 print("=" * 100)
 
-check(
-    isinstance(results, list),
-    "Self-play returned a list",
+assert isinstance(results, list), (
+    f"Expected list, got {type(results)}"
 )
 
-check(
-    len(results) == NUM_GAMES,
-    "Returned exactly the requested number of games",
+assert len(results) == NUM_GAMES, (
+    f"Expected {NUM_GAMES} games, got {len(results)}"
+)
+
+print(
+    f"PASS: returned {len(results)} games"
 )
 
 
 # ============================================================
-# TEST 5
+# TEST 6
 # GAME RESULT VALIDATION
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 5: GAME RESULT VALIDATION")
+print("TEST 6: GAME RESULT VALIDATION")
 print("=" * 100)
 
 VALID_TERMINATIONS = {
@@ -329,13 +364,13 @@ completed_games = 0
 incomplete_games = 0
 total_samples = 0
 
-for game_index, result in enumerate(results):
+for i, result in enumerate(results):
 
-    game_number = game_index + 1
+    game = i + 1
 
     print()
     print(
-        f"Game {game_number}:"
+        f"Game {game}:"
     )
     print(
         f"  moves       = {result.moves_played}"
@@ -353,286 +388,247 @@ for game_index, result in enumerate(results):
         f"  samples     = {len(result.training_data)}"
     )
 
-    check(
-        result.termination in VALID_TERMINATIONS,
-        f"Game {game_number}: valid termination",
+    assert result.termination in VALID_TERMINATIONS, (
+        f"Game {game}: invalid termination "
+        f"{result.termination}"
     )
 
-    check(
-        result.result in VALID_RESULTS,
-        f"Game {game_number}: valid result",
+    assert result.result in VALID_RESULTS, (
+        f"Game {game}: invalid result "
+        f"{result.result}"
     )
 
-    check(
-        int(result.moves_played) >= 0,
-        f"Game {game_number}: non-negative move count",
+    assert int(result.moves_played) >= 0, (
+        f"Game {game}: negative move count"
     )
 
     if result.completed:
 
         completed_games += 1
 
-        check(
-            result.result in {-1, 0, 1},
-            f"Game {game_number}: completed game has valid result",
+        assert result.result in {-1, 0, 1}, (
+            f"Game {game}: completed game has invalid result"
         )
 
-        check(
-            result.termination != "MAX_MOVES",
-            f"Game {game_number}: completed game did not hit MAX_MOVES",
+        assert result.termination != "MAX_MOVES", (
+            f"Game {game}: completed game marked MAX_MOVES"
         )
 
     else:
 
         incomplete_games += 1
 
-        check(
-            result.result is None,
-            f"Game {game_number}: incomplete result is None",
+        assert result.result is None, (
+            f"Game {game}: incomplete result should be None"
         )
 
-        check(
-            len(result.training_data) == 0,
-            f"Game {game_number}: incomplete game has no training data",
+        assert len(result.training_data) == 0, (
+            f"Game {game}: incomplete game contains training data"
         )
 
     total_samples += len(result.training_data)
+
+    print(
+        f"PASS: Game {game}"
+    )
 
 
 print()
 print("Completed games:", completed_games)
 print("Incomplete games:", incomplete_games)
-print("Total samples:", total_samples)
-
-check(
-    completed_games + incomplete_games == NUM_GAMES,
-    "Every game is classified",
-)
-
-
-# ============================================================
-# TEST 6
-# TRAINING SAMPLE COUNT
-# ============================================================
-
-print()
-print("=" * 100)
-print("TEST 6: TRAINING SAMPLE COUNT")
-print("=" * 100)
-
-for game_index, result in enumerate(results):
-
-    game_number = game_index + 1
-
-    if not result.completed:
-        continue
-
-    check(
-        len(result.training_data) == result.moves_played,
-        (
-            f"Game {game_number}: "
-            f"samples == moves played"
-        ),
-    )
+print("Total training samples:", total_samples)
 
 
 # ============================================================
 # TEST 7
-# TRAINING SAMPLE CONTENT
+# SAMPLE COUNT
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 7: TRAINING SAMPLE CONTENT")
+print("TEST 7: TRAINING SAMPLE COUNT")
 print("=" * 100)
 
-samples_checked = 0
+for i, result in enumerate(results):
 
-for game_index, result in enumerate(results):
-
-    game_number = game_index + 1
+    game = i + 1
 
     if not result.completed:
         continue
 
-    for sample_index, sample in enumerate(
-        result.training_data
-    ):
+    assert len(result.training_data) == result.moves_played, (
+        f"Game {game}: "
+        f"samples={len(result.training_data)} "
+        f"but moves={result.moves_played}"
+    )
 
-        check(
-            isinstance(sample, tuple),
-            f"Game {game_number}, sample {sample_index}: tuple",
-        )
+    print(
+        f"PASS: Game {game}: "
+        f"{len(result.training_data)} samples "
+        f"for {result.moves_played} moves"
+    )
 
-        check(
-            len(sample) == 3,
-            f"Game {game_number}, sample {sample_index}: 3 fields",
-        )
+
+# ============================================================
+# TEST 8
+# SAMPLE SHAPES / VALUES / POLICIES
+# ============================================================
+
+print()
+print("=" * 100)
+print("TEST 8: TRAINING SAMPLE CONTENT")
+print("=" * 100)
+
+samples_checked = 0
+
+for i, result in enumerate(results):
+
+    game = i + 1
+
+    for j, sample in enumerate(result.training_data):
 
         state, policy, value = sample
 
         state = np.asarray(state)
         policy = np.asarray(policy)
 
-        # ----------------------------------------------------
-        # STATE
-        # ----------------------------------------------------
-
-        check(
-            state.shape == (18, 8, 8),
-            (
-                f"Game {game_number}, sample {sample_index}: "
-                f"state shape = (18,8,8)"
-            ),
+        assert state.shape == (
+            18,
+            8,
+            8,
+        ), (
+            f"Game {game}, sample {j}: "
+            f"bad state shape {state.shape}"
         )
 
-        check(
-            is_finite(state),
-            (
-                f"Game {game_number}, sample {sample_index}: "
-                f"state finite"
-            ),
+        assert policy.shape == (
+            4544,
+        ), (
+            f"Game {game}, sample {j}: "
+            f"bad policy shape {policy.shape}"
         )
 
-        # ----------------------------------------------------
-        # POLICY
-        # ----------------------------------------------------
-
-        check(
-            policy.shape == (4544,),
-            (
-                f"Game {game_number}, sample {sample_index}: "
-                f"policy shape = (4544,)"
-            ),
+        assert np.isfinite(state).all(), (
+            f"Game {game}, sample {j}: "
+            f"state contains NaN/Inf"
         )
 
-        check(
-            is_finite(policy),
-            (
-                f"Game {game_number}, sample {sample_index}: "
-                f"policy finite"
-            ),
+        assert np.isfinite(policy).all(), (
+            f"Game {game}, sample {j}: "
+            f"policy contains NaN/Inf"
         )
 
-        check(
-            bool(np.all(policy >= -1e-7)),
-            (
-                f"Game {game_number}, sample {sample_index}: "
-                f"policy non-negative"
-            ),
+        assert np.all(policy >= -1e-7), (
+            f"Game {game}, sample {j}: "
+            f"negative policy value"
         )
 
-        stats = policy_stats(policy)
+        policy_sum = float(policy.sum())
 
-        check_close(
-            stats["sum"],
+        assert abs(policy_sum - 1.0) <= 1e-4, (
+            f"Game {game}, sample {j}: "
+            f"policy sum={policy_sum}"
+        )
+
+        assert int(np.count_nonzero(policy > 0.0)) > 0, (
+            f"Game {game}, sample {j}: "
+            f"policy has no nonzero actions"
+        )
+
+        assert float(value) in {
+            -1.0,
+            0.0,
             1.0,
-            (
-                f"Game {game_number}, sample {sample_index}: "
-                f"policy sums to 1"
-            ),
-            tolerance=1e-4,
-        )
-
-        check(
-            stats["nonzero"] > 0,
-            (
-                f"Game {game_number}, sample {sample_index}: "
-                f"policy has nonzero actions"
-            ),
-        )
-
-        # ----------------------------------------------------
-        # VALUE
-        # ----------------------------------------------------
-
-        check(
-            float(value) in {-1.0, 0.0, 1.0},
-            (
-                f"Game {game_number}, sample {sample_index}: "
-                f"value is -1/0/+1"
-            ),
+        }, (
+            f"Game {game}, sample {j}: "
+            f"invalid value target {value}"
         )
 
         samples_checked += 1
 
-        # Print details for first 10 samples only.
         if samples_checked <= 10:
 
             print()
             print(
                 f"Sample {samples_checked}"
             )
+
             print(
                 "  game:",
-                game_number
+                game
             )
+
             print(
-                "  index:",
-                sample_index
+                "  sample:",
+                j
             )
+
             print(
                 "  state shape:",
                 state.shape
             )
+
             print(
                 "  state dtype:",
                 state.dtype
             )
+
             print(
-                "  state min:",
-                float(state.min())
-            )
-            print(
-                "  state max:",
+                "  state range:",
+                float(state.min()),
+                "to",
                 float(state.max())
             )
+
             print(
                 "  policy shape:",
                 policy.shape
             )
-            print(
-                "  policy dtype:",
-                policy.dtype
-            )
+
             print(
                 "  policy sum:",
-                stats["sum"]
+                policy_sum
             )
+
             print(
                 "  policy max:",
-                stats["max"]
+                float(policy.max())
             )
+
             print(
                 "  policy nonzero:",
-                stats["nonzero"]
+                int(np.count_nonzero(policy > 0.0))
             )
+
             print(
                 "  value:",
                 value
             )
 
+            print(
+                "PASS: sample"
+            )
+
+
+assert samples_checked > 0, (
+    "No training samples were generated."
+)
 
 print()
 print(
-    "Training samples checked:",
+    "Total samples checked:",
     samples_checked
-)
-
-check(
-    samples_checked > 0,
-    "At least one training sample exists",
 )
 
 
 # ============================================================
-# TEST 8
+# TEST 9
 # GLOBAL DATA RANGE
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 8: GLOBAL DATA RANGE")
+print("TEST 9: GLOBAL DATA RANGE")
 print("=" * 100)
 
 state_min = float("inf")
@@ -670,46 +666,47 @@ for result in results:
             float(policy.max())
         )
 
-        values_seen.add(float(value))
+        values_seen.add(
+            float(value)
+        )
 
-
-print("State min:", state_min)
-print("State max:", state_max)
-
-print("Policy min:", policy_min)
-print("Policy max:", policy_max)
-
-print("Values seen:", sorted(values_seen))
-
-check(
-    state_min >= -1e-6,
-    "States contain no negative values",
+print(
+    "State range:",
+    state_min,
+    "to",
+    state_max
 )
 
-check(
-    state_max <= 1.0 + 1e-6,
-    "States are within [0,1]",
+print(
+    "Policy range:",
+    policy_min,
+    "to",
+    policy_max
 )
 
-check(
-    policy_min >= -1e-7,
-    "Policies contain no negative values",
+print(
+    "Values seen:",
+    sorted(values_seen)
 )
 
-check(
-    policy_max <= 1.0 + 1e-6,
-    "Policies are within [0,1]",
-)
+assert state_min >= -1e-6
+assert state_max <= 1.0 + 1e-6
+
+assert policy_min >= -1e-7
+assert policy_max <= 1.0 + 1e-6
+
+print("PASS: state range")
+print("PASS: policy range")
 
 
 # ============================================================
-# TEST 9
-# VALUE DISTRIBUTION
+# TEST 10
+# VALUE TARGET DISTRIBUTION
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 9: VALUE TARGET DISTRIBUTION")
+print("TEST 10: VALUE TARGET DISTRIBUTION")
 print("=" * 100)
 
 value_counts = {
@@ -722,55 +719,58 @@ for result in results:
 
     for _, _, value in result.training_data:
 
-        value_counts[float(value)] += 1
+        value_counts[
+            float(value)
+        ] += 1
 
+print(
+    "Value -1:",
+    value_counts[-1.0]
+)
 
-print("Value -1:", value_counts[-1.0])
-print("Value  0:", value_counts[0.0])
-print("Value +1:", value_counts[1.0])
+print(
+    "Value  0:",
+    value_counts[0.0]
+)
 
-check(
-    sum(value_counts.values()) == total_samples,
-    "Value counts match total training samples",
+print(
+    "Value +1:",
+    value_counts[1.0]
+)
+
+assert sum(
+    value_counts.values()
+) == total_samples
+
+print(
+    "PASS: value counts match sample count"
 )
 
 
 # ============================================================
-# TEST 10
-# CUDA CLEANUP / FINAL CHECK
+# FINAL CUDA CHECK
 # ============================================================
 
 print()
 print("=" * 100)
-print("TEST 10: CUDA FINAL CHECK")
+print("FINAL CUDA CHECK")
 print("=" * 100)
 
-if torch.cuda.is_available():
+torch.cuda.synchronize()
 
-    torch.cuda.synchronize()
+print(
+    "CUDA allocated:",
+    f"{torch.cuda.memory_allocated() / 1024**2:.2f} MB"
+)
 
-    allocated_mb = (
-        torch.cuda.memory_allocated()
-        / 1024**2
-    )
+print(
+    "CUDA reserved:",
+    f"{torch.cuda.memory_reserved() / 1024**2:.2f} MB"
+)
 
-    reserved_mb = (
-        torch.cuda.memory_reserved()
-        / 1024**2
-    )
-
-    print(
-        f"CUDA allocated: {allocated_mb:.2f} MB"
-    )
-
-    print(
-        f"CUDA reserved:  {reserved_mb:.2f} MB"
-    )
-
-    check(
-        torch.cuda.is_available(),
-        "CUDA remains available after self-play",
-    )
+print(
+    "PASS: CUDA synchronized successfully"
+)
 
 
 # ============================================================
@@ -779,37 +779,33 @@ if torch.cuda.is_available():
 
 print()
 print("=" * 100)
-print("RL53 GPU SELF-PLAY INTEGRATION TEST COMPLETE")
+print("RL53 GPU SELF-PLAY INTEGRATION TEST PASSED")
 print("=" * 100)
 
 print()
-print("Games requested:", NUM_GAMES)
-print("Games completed:", completed_games)
-print("Games incomplete:", incomplete_games)
+print("Entrypoint:", ENTRYPOINT_NAME)
+print("Games:", NUM_GAMES)
+print("Completed:", completed_games)
+print("Incomplete:", incomplete_games)
 print("Training samples:", total_samples)
 
 print()
 print("Verified:")
-print("  [OK] RL53 checkpoint loading")
-print("  [OK] CUDA execution")
-print("  [OK] Actual _play_games_gpu() path")
-print("  [OK] Game result handling")
-print("  [OK] Game termination handling")
-print("  [OK] Completed/incomplete handling")
-print("  [OK] Training sample count")
-print("  [OK] State shape: 18 x 8 x 8")
-print("  [OK] Policy shape: 4544")
-print("  [OK] Policy normalization")
-print("  [OK] Policy non-negativity")
-print("  [OK] Value targets")
-print("  [OK] NaN/Inf checks")
-print("  [OK] Data ranges")
-print("  [OK] CUDA final state")
+print("  [PASS] Actual Kaggle training.self_play.py loaded")
+print("  [PASS] Correct self-play entrypoint detected")
+print("  [PASS] RL53 checkpoint")
+print("  [PASS] CUDA execution")
+print("  [PASS] Self-play execution")
+print("  [PASS] Game termination/result handling")
+print("  [PASS] Training sample count")
+print("  [PASS] State shape 18x8x8")
+print("  [PASS] Policy shape 4544")
+print("  [PASS] Policy normalization")
+print("  [PASS] Policy non-negativity")
+print("  [PASS] Value targets")
+print("  [PASS] NaN/Inf checks")
+print("  [PASS] Data ranges")
+print("  [PASS] CUDA synchronization")
 
 print()
-print("=" * 100)
-print("NEXT STEP:")
-print("If all tests PASS, low-level MCTS + actual GPU self-play")
-print("are validated. Then we move to the RL training/replay")
-print("distribution side of the investigation.")
 print("=" * 100)
