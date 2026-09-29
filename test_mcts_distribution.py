@@ -1,44 +1,29 @@
 import torch
+import random
 
 from model.chess_net import ChessNet
 from environment.gpu_chess import GPUChess
-from mcts.gpu_mcts import GPUMCTS
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-CHECKPOINT = "/kaggle/working/chess-zero/checkpoints/rl_iteration_53.pt"
+CHECKPOINT = (
+    "/kaggle/working/chess-zero/checkpoints/"
+    "rl_iteration_53.pt"
+)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+REPLAY_BUFFER = (
+    "/kaggle/working/chess-zero/checkpoints/"
+    "replay_buffer_rl53.pt"
+)
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 NUM_POSITIONS = 32
-
-BATCH_SIZE = 16
-
-TESTS = [
-    {
-        "name": "100 sims + noise",
-        "simulations": 100,
-        "noise": True,
-    },
-    {
-        "name": "100 sims + no noise",
-        "simulations": 100,
-        "noise": False,
-    },
-    {
-        "name": "200 sims + no noise",
-        "simulations": 200,
-        "noise": False,
-    },
-    {
-        "name": "400 sims + no noise",
-        "simulations": 400,
-        "noise": False,
-    },
-]
 
 
 # ============================================================
@@ -46,11 +31,13 @@ TESTS = [
 # ============================================================
 
 print("=" * 70)
-print("MCTS DISTRIBUTION DIAGNOSTIC")
+print("RL53 REPLAY BUFFER POLICY DIAGNOSTIC")
 print("=" * 70)
 
 print(f"Device: {DEVICE}")
 print(f"Checkpoint: {CHECKPOINT}")
+print(f"Replay buffer: {REPLAY_BUFFER}")
+
 
 model = ChessNet().to(DEVICE)
 
@@ -61,7 +48,9 @@ checkpoint = torch.load(
 )
 
 if "model_state_dict" in checkpoint:
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
 else:
     model.load_state_dict(checkpoint)
 
@@ -71,111 +60,271 @@ print("Model loaded.")
 
 
 # ============================================================
-# CREATE TEST POSITIONS
+# LOAD REPLAY BUFFER
 # ============================================================
 
-print("\nCreating test positions...")
+print("\nLoading replay buffer...")
 
-states = GPUChess(DEVICE, NUM_POSITIONS)
+buffer = torch.load(
+    REPLAY_BUFFER,
+    map_location="cpu",
+    weights_only=False,
+)
 
-# Use identical starting positions for every experiment.
-states.reset()
-
-print(f"Positions: {NUM_POSITIONS}")
-
-
-# ============================================================
-# METRICS
-# ============================================================
-
-def calculate_metrics(policy):
-    """
-    Calculate policy distribution statistics.
-
-    policy shape:
-        [batch, 4544]
-    """
-
-    nonzero = policy > 0
-
-    # --------------------------------------------------------
-    # Entropy
-    # --------------------------------------------------------
-
-    safe_policy = policy.clamp_min(1e-12)
-
-    entropy = -(safe_policy * safe_policy.log()).sum(dim=1)
-
-    # --------------------------------------------------------
-    # Number of actions receiving probability / visits
-    # --------------------------------------------------------
-
-    num_visited = nonzero.sum(dim=1).float()
-
-    # --------------------------------------------------------
-    # Maximum probability
-    # --------------------------------------------------------
-
-    max_probability = policy.max(dim=1).values
-
-    # --------------------------------------------------------
-    # Normalized entropy
-    # --------------------------------------------------------
-
-    normalized_entropy = []
-
-    for i in range(policy.shape[0]):
-
-        p = policy[i]
-
-        mask = p > 0
-
-        n = mask.sum()
-
-        if n > 1:
-
-            max_entropy = torch.log(n.float())
-
-            normalized = entropy[i] / max_entropy
-
-        else:
-
-            normalized = torch.tensor(
-                0.0,
-                device=policy.device,
-            )
-
-        normalized_entropy.append(normalized)
-
-    normalized_entropy = torch.stack(normalized_entropy)
-
-    return {
-        "entropy": entropy.mean().item(),
-
-        "normalized_entropy": normalized_entropy.mean().item(),
-
-        "max_probability": max_probability.mean().item(),
-
-        "visited_actions": num_visited.mean().item(),
-
-        "max_probability_min": max_probability.min().item(),
-
-        "max_probability_max": max_probability.max().item(),
-    }
+print(f"Replay buffer type: {type(buffer)}")
 
 
 # ============================================================
-# RAW NETWORK POLICY TEST
+# EXTRACT SAMPLES
+# ============================================================
+
+if hasattr(buffer, "buffer"):
+    samples = list(buffer.buffer)
+
+elif isinstance(buffer, (list, tuple)):
+    samples = list(buffer)
+
+elif isinstance(buffer, dict):
+
+    if "buffer" in buffer:
+        samples = list(buffer["buffer"])
+
+    elif "samples" in buffer:
+        samples = list(buffer["samples"])
+
+    else:
+        raise RuntimeError(
+            f"Unknown replay-buffer dictionary keys: "
+            f"{buffer.keys()}"
+        )
+
+else:
+    raise RuntimeError(
+        f"Unknown replay buffer type: {type(buffer)}"
+    )
+
+
+print(f"Total replay samples: {len(samples)}")
+
+
+if len(samples) < NUM_POSITIONS:
+    raise RuntimeError(
+        f"Replay buffer contains only {len(samples)} "
+        f"samples."
+    )
+
+
+# ============================================================
+# INSPECT SAMPLE STRUCTURE
 # ============================================================
 
 print("\n")
 print("=" * 70)
-print("RAW NETWORK POLICY")
+print("REPLAY SAMPLE STRUCTURE")
 print("=" * 70)
 
-print(
-    "Testing the neural network policy BEFORE MCTS..."
+example = samples[0]
+
+print(f"Sample type: {type(example)}")
+
+if hasattr(example, "__dict__"):
+    print("Sample attributes:")
+
+    for key, value in example.__dict__.items():
+        if torch.is_tensor(value):
+            print(
+                f"  {key}: "
+                f"Tensor shape={tuple(value.shape)}, "
+                f"dtype={value.dtype}"
+            )
+        else:
+            print(
+                f"  {key}: "
+                f"{type(value).__name__} = {value}"
+            )
+
+elif isinstance(example, dict):
+
+    print("Sample dictionary:")
+
+    for key, value in example.items():
+
+        if torch.is_tensor(value):
+            print(
+                f"  {key}: "
+                f"Tensor shape={tuple(value.shape)}, "
+                f"dtype={value.dtype}"
+            )
+
+        else:
+            print(
+                f"  {key}: "
+                f"{type(value).__name__}"
+            )
+
+elif isinstance(example, (tuple, list)):
+
+    print(
+        f"Sample contains {len(example)} elements:"
+    )
+
+    for i, value in enumerate(example):
+
+        if torch.is_tensor(value):
+            print(
+                f"  [{i}]: "
+                f"Tensor shape={tuple(value.shape)}, "
+                f"dtype={value.dtype}"
+            )
+
+        else:
+            print(
+                f"  [{i}]: "
+                f"{type(value).__name__}"
+            )
+
+
+# ============================================================
+# GET STATE FROM REPLAY SAMPLE
+# ============================================================
+
+def get_state(sample):
+
+    """
+    Extract the chess state from a replay sample.
+
+    The diagnostic handles the common formats used
+    by the project.
+    """
+
+    # --------------------------------------------------------
+    # Object-style sample
+    # --------------------------------------------------------
+
+    if hasattr(sample, "state"):
+
+        return sample.state
+
+    # --------------------------------------------------------
+    # Dictionary-style sample
+    # --------------------------------------------------------
+
+    if isinstance(sample, dict):
+
+        for key in [
+            "state",
+            "board",
+            "observation",
+            "state_tensor",
+        ]:
+
+            if key in sample:
+                return sample[key]
+
+    # --------------------------------------------------------
+    # Tuple/list style
+    # --------------------------------------------------------
+
+    if isinstance(sample, (tuple, list)):
+
+        # Normally state is first element.
+        return sample[0]
+
+    raise RuntimeError(
+        "Could not determine state from replay sample."
+    )
+
+
+# ============================================================
+# SELECT RANDOM REAL POSITIONS
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("SELECTING REAL REPLAY POSITIONS")
+print("=" * 70)
+
+random.seed(42)
+
+selected_samples = random.sample(
+    samples,
+    NUM_POSITIONS,
 )
+
+states_raw = []
+
+for sample in selected_samples:
+
+    state = get_state(sample)
+
+    states_raw.append(state)
+
+
+# ============================================================
+# CONVERT STATES
+# ============================================================
+
+print("Converting replay states...")
+
+
+# ------------------------------------------------------------
+# Case 1: already GPUChess
+# ------------------------------------------------------------
+
+if all(
+    isinstance(x, GPUChess)
+    for x in states_raw
+):
+
+    # Usually not expected after torch.load,
+    # but supported.
+    states = states_raw
+
+
+# ------------------------------------------------------------
+# Case 2: state tensors
+# ------------------------------------------------------------
+
+elif torch.is_tensor(states_raw[0]):
+
+    state_tensor = torch.stack(
+        [
+            x.float()
+            for x in states_raw
+        ]
+    )
+
+    print(
+        f"State tensor shape: "
+        f"{tuple(state_tensor.shape)}"
+    )
+
+    raise RuntimeError(
+        "\nYour replay buffer stores encoded state tensors "
+        "rather than GPUChess board states.\n\n"
+        "Send me the 'REPLAY SAMPLE STRUCTURE' output above "
+        "and I will adapt the conversion exactly to your "
+        "replay-buffer format."
+    )
+
+
+else:
+
+    raise RuntimeError(
+        f"Unsupported replay state type: "
+        f"{type(states_raw[0])}"
+    )
+
+
+# ============================================================
+# RAW NETWORK POLICY
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("RAW RL53 POLICY ON REAL GAME POSITIONS")
+print("=" * 70)
+
 
 with torch.inference_mode():
 
@@ -187,10 +336,6 @@ with torch.inference_mode():
             memory_format=torch.channels_last
         )
 
-    # --------------------------------------------------------
-    # Neural network prediction
-    # --------------------------------------------------------
-
     if DEVICE.type == "cuda":
 
         with torch.autocast(
@@ -198,20 +343,24 @@ with torch.inference_mode():
             dtype=torch.float16,
         ):
 
-            logits, values = model(model_input)
+            logits, values = model(
+                model_input
+            )
 
     else:
 
-        logits, values = model(model_input)
+        logits, values = model(
+            model_input
+        )
 
     # --------------------------------------------------------
-    # Legal move mask
+    # Legal moves
     # --------------------------------------------------------
 
     legal = states.legal_move_mask()
 
     # --------------------------------------------------------
-    # Remove illegal moves from policy
+    # Mask illegal actions
     # --------------------------------------------------------
 
     masked_logits = logits.float().masked_fill(
@@ -220,241 +369,161 @@ with torch.inference_mode():
     )
 
     # --------------------------------------------------------
-    # Convert logits to probabilities
+    # Policy
     # --------------------------------------------------------
 
-    network_policy = torch.softmax(
+    policy = torch.softmax(
         masked_logits,
         dim=1,
     )
 
-raw_metrics = calculate_metrics(network_policy)
+
+# ============================================================
+# METRICS
+# ============================================================
+
+safe_policy = policy.clamp_min(1e-12)
+
+entropy = -(
+    safe_policy * safe_policy.log()
+).sum(dim=1)
+
+num_legal = legal.sum(
+    dim=1
+).float()
+
+normalized_entropy = (
+    entropy /
+    torch.log(num_legal.clamp_min(2))
+)
+
+max_probability = policy.max(
+    dim=1
+).values
+
+
+# ============================================================
+# RESULTS
+# ============================================================
 
 print(
-    f"Entropy:              "
-    f"{raw_metrics['entropy']:.4f}"
+    f"\nAverage legal moves: "
+    f"{num_legal.mean().item():.2f}"
 )
 
 print(
-    f"Normalized entropy:   "
-    f"{raw_metrics['normalized_entropy']:.4f}"
+    f"Entropy: "
+    f"{entropy.mean().item():.4f}"
 )
 
 print(
-    f"Max probability:      "
-    f"{raw_metrics['max_probability']:.4f}"
+    f"Normalized entropy: "
+    f"{normalized_entropy.mean().item():.4f}"
 )
 
 print(
-    f"Visited actions:      "
-    f"{raw_metrics['visited_actions']:.2f}"
+    f"Max probability: "
+    f"{max_probability.mean().item():.4f}"
 )
 
 print(
-    f"Max probability min:  "
-    f"{raw_metrics['max_probability_min']:.4f}"
+    f"Max probability min: "
+    f"{max_probability.min().item():.4f}"
 )
 
 print(
-    f"Max probability max:  "
-    f"{raw_metrics['max_probability_max']:.4f}"
+    f"Max probability max: "
+    f"{max_probability.max().item():.4f}"
 )
 
 
 # ============================================================
-# SHOW EXAMPLE RAW NETWORK POLICY
-# ============================================================
-
-print("\n")
-print("=" * 70)
-print("EXAMPLE RAW NETWORK POLICY")
-print("=" * 70)
-
-example_policy = network_policy[0]
-
-legal_actions = torch.nonzero(
-    legal[0],
-    as_tuple=False,
-).flatten()
-
-legal_probs = example_policy[legal_actions]
-
-top_k = min(10, legal_actions.numel())
-
-top_probs, top_indices = torch.topk(
-    legal_probs,
-    k=top_k,
-)
-
-top_actions = legal_actions[top_indices]
-
-print("\nTop network actions for position 0:")
-
-for rank in range(top_k):
-
-    action = top_actions[rank].item()
-
-    probability = top_probs[rank].item()
-
-    print(
-        f"{rank + 1:2d}. "
-        f"Action {action:4d}  "
-        f"Probability {probability:.4f}"
-    )
-
-
-# ============================================================
-# RUN MCTS TESTS
-# ============================================================
-
-results = []
-
-for test in TESTS:
-
-    print("\n")
-    print("=" * 70)
-    print(test["name"])
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # Fresh MCTS tree
-    # --------------------------------------------------------
-
-    mcts = GPUMCTS(
-        model=model,
-        device=DEVICE,
-        c_puct=1.5,
-    )
-
-    # --------------------------------------------------------
-    # Fresh identical positions
-    # --------------------------------------------------------
-
-    test_states = GPUChess(
-        DEVICE,
-        NUM_POSITIONS,
-    )
-
-    test_states.reset()
-
-    # --------------------------------------------------------
-    # Run MCTS
-    # --------------------------------------------------------
-
-    mcts.search(
-        root_states=test_states,
-        num_simulations=test["simulations"],
-        dirichlet_alpha=(
-            0.3 if test["noise"] else None
-        ),
-        dirichlet_epsilon=0.25,
-        batch_size=BATCH_SIZE,
-    )
-
-    # --------------------------------------------------------
-    # Get MCTS visit-count policy
-    # --------------------------------------------------------
-
-    policy = mcts.root_visit_policy()
-
-    metrics = calculate_metrics(policy)
-
-    results.append(
-        {
-            "name": test["name"],
-            **metrics,
-        }
-    )
-
-    print(
-        f"Simulations:          "
-        f"{test['simulations']}"
-    )
-
-    print(
-        f"Dirichlet noise:      "
-        f"{test['noise']}"
-    )
-
-    print(
-        f"Entropy:              "
-        f"{metrics['entropy']:.4f}"
-    )
-
-    print(
-        f"Normalized entropy:   "
-        f"{metrics['normalized_entropy']:.4f}"
-    )
-
-    print(
-        f"Max visit probability:"
-        f"{metrics['max_probability']:.4f}"
-    )
-
-    print(
-        f"Visited actions:      "
-        f"{metrics['visited_actions']:.2f}"
-    )
-
-    print(
-        f"Max probability min:  "
-        f"{metrics['max_probability_min']:.4f}"
-    )
-
-    print(
-        f"Max probability max:  "
-        f"{metrics['max_probability_max']:.4f}"
-    )
-
-
-# ============================================================
-# FINAL COMPARISON
+# POSITION-BY-POSITION RESULTS
 # ============================================================
 
 print("\n")
-print("=" * 100)
-print("FINAL RESULTS")
-print("=" * 100)
+print("=" * 90)
+print("POSITION-BY-POSITION RESULTS")
+print("=" * 90)
 
 print(
-    f"{'Test':<25}"
+    f"{'Pos':>5}"
+    f"{'Legal':>10}"
     f"{'Entropy':>12}"
-    f"{'Norm Entropy':>15}"
+    f"{'Norm Ent':>12}"
     f"{'Max Prob':>12}"
-    f"{'Visited':>12}"
 )
 
-print("-" * 100)
+print("-" * 90)
 
-
-# ------------------------------------------------------------
-# Raw network
-# ------------------------------------------------------------
-
-print(
-    f"{'RAW NETWORK':<25}"
-    f"{raw_metrics['entropy']:>12.4f}"
-    f"{raw_metrics['normalized_entropy']:>15.4f}"
-    f"{raw_metrics['max_probability']:>12.4f}"
-    f"{raw_metrics['visited_actions']:>12.2f}"
-)
-
-
-# ------------------------------------------------------------
-# MCTS results
-# ------------------------------------------------------------
-
-for r in results:
+for i in range(NUM_POSITIONS):
 
     print(
-        f"{r['name']:<25}"
-        f"{r['entropy']:>12.4f}"
-        f"{r['normalized_entropy']:>15.4f}"
-        f"{r['max_probability']:>12.4f}"
-        f"{r['visited_actions']:>12.2f}"
+        f"{i + 1:>5}"
+        f"{int(num_legal[i].item()):>10}"
+        f"{entropy[i].item():>12.4f}"
+        f"{normalized_entropy[i].item():>12.4f}"
+        f"{max_probability[i].item():>12.4f}"
     )
 
-print("=" * 100)
+
+# ============================================================
+# TOP MOVES
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("TOP NETWORK MOVES")
+print("=" * 70)
+
+for position in range(
+    min(5, NUM_POSITIONS)
+):
+
+    legal_actions = torch.nonzero(
+        legal[position],
+        as_tuple=False,
+    ).flatten()
+
+    legal_probs = policy[
+        position,
+        legal_actions,
+    ]
+
+    top_k = min(
+        10,
+        legal_actions.numel(),
+    )
+
+    top_probs, top_indices = torch.topk(
+        legal_probs,
+        k=top_k,
+    )
+
+    top_actions = legal_actions[
+        top_indices
+    ]
+
+    print(
+        f"\nPosition {position + 1}:"
+    )
+
+    for rank in range(top_k):
+
+        action = top_actions[
+            rank
+        ].item()
+
+        probability = top_probs[
+            rank
+        ].item()
+
+        print(
+            f"  {rank + 1:2d}. "
+            f"Action {action:4d} "
+            f"Probability "
+            f"{probability:.4f}"
+        )
 
 
 # ============================================================
@@ -463,30 +532,25 @@ print("=" * 100)
 
 print("\n")
 print("=" * 70)
-print("INTERPRETATION")
+print("WHAT THIS TEST TELLS US")
 print("=" * 70)
 
 print(
-    "\nRAW NETWORK tells us what RL53 itself believes."
-)
+    """
+This test uses real positions sampled from the RL53
+replay buffer rather than the initial chess position.
 
-print(
-    "MCTS results tell us how the search changes that policy."
-)
+If normalized entropy remains around 0.95-1.00
+across real positions, the RL53 policy is very diffuse.
 
-print(
-    "\nIf RAW NETWORK is already highly uniform, "
-    "the main issue is likely upstream of MCTS."
-)
+If entropy becomes substantially lower on real
+middle-game/tactical positions, the opening-position
+result was not representative.
 
-print(
-    "If RAW NETWORK is concentrated but MCTS becomes "
-    "highly uniform, we should investigate MCTS."
-)
-
-print(
-    "\nCompare RAW NETWORK against the four MCTS tests "
-    "before changing any training or MCTS parameters."
+The next step after this test is to compare these
+network policies against the MCTS target policies
+stored in the replay buffer.
+"""
 )
 
 print("=" * 70)
