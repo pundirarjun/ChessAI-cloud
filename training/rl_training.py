@@ -52,12 +52,12 @@ from training.train_step import train_from_replay_buffer
 # Iteration / paths
 # ---------------------------------------------------------------------------
 
-RL_ITERATION = 53
+RL_ITERATION = 54
 
 PREVIOUS_ITERATION = RL_ITERATION - 1
 
 KAGGLE_CHECKPOINT_ROOT = (
-    "/kaggle/input/datasets/arjunthakur9999/checkpoints/chess_checkpoints (4)"
+    "/kaggle/input/datasets/arjunthakur9999/checkpoints/chess_checkpoints (5)"
 )
 
 LOCAL_CHECKPOINT_ROOT = "checkpoints"
