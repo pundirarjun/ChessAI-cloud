@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import sys
 import random
+import re
 
 import numpy as np
 import torch
@@ -215,6 +216,18 @@ def load_previous_checkpoint(
         weights_only=False,
     )
 
+    checkpoint_iteration = checkpoint.get("iteration")
+    if checkpoint_iteration is None:
+        raise RuntimeError(
+            "Previous checkpoint is missing its iteration metadata; "
+            f"expected RL{PREVIOUS_ITERATION}."
+        )
+    if int(checkpoint_iteration) != PREVIOUS_ITERATION:
+        raise RuntimeError(
+            "Checkpoint iteration does not match the configured predecessor: "
+            f"got RL{checkpoint_iteration}, expected RL{PREVIOUS_ITERATION}."
+        )
+
     model.load_state_dict(
         checkpoint["model_state_dict"]
     )
@@ -265,6 +278,18 @@ def load_previous_replay_buffer(path):
 
     path = _resolve_path(path)
 
+    match = re.fullmatch(r"replay_buffer_rl(\d+)\.pt", os.path.basename(path))
+    if match is None:
+        raise RuntimeError(
+            "Replay buffer filename must identify its source iteration: "
+            f"{path}"
+        )
+    if int(match.group(1)) != PREVIOUS_ITERATION:
+        raise RuntimeError(
+            "Replay buffer iteration does not match the configured predecessor: "
+            f"got RL{match.group(1)}, expected RL{PREVIOUS_ITERATION}."
+        )
+
     data = torch.load(
         path,
         map_location="cpu",
@@ -285,6 +310,11 @@ def load_previous_replay_buffer(path):
 
     # The deque now owns the sample references.
     del data
+
+    provenance = replay.validate_provenance(
+        expected_max_iteration=PREVIOUS_ITERATION,
+    )
+    print("Replay provenance validated:", provenance)
 
     return replay, path
 
@@ -503,6 +533,7 @@ def train_model(
 def save_rl_checkpoint(
     model,
     optimizer,
+    replay_buffer,
     self_play_stats,
     training_stats,
 ):
@@ -526,6 +557,12 @@ def save_rl_checkpoint(
 
         "previous_checkpoint":
             PREVIOUS_CHECKPOINT,
+
+        "replay_buffer_provenance": {
+            "filename": os.path.basename(OUTPUT_REPLAY_BUFFER),
+            "sample_count": len(replay_buffer),
+            "source_distribution": dict(replay_buffer.iteration_distribution()),
+        },
 
         **self_play_stats,
 
@@ -748,6 +785,7 @@ def main():
     save_rl_checkpoint(
         model,
         optimizer,
+        replay,
         self_play_stats,
         training_stats,
     )

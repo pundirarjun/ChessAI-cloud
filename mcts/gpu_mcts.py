@@ -68,6 +68,10 @@ class GPUMCTS:
         self.edge_prior = None
         self.edge_valid = None
         self.edge_used = 0
+        # Search diagnostics: duplicate selections are expected to be rare with
+        # virtual loss, but must never cause duplicate node expansion.
+        self.last_duplicate_leaf_count = 0
+        self.total_duplicate_leaf_count = 0
 
         # Reused indexing buffers. These avoid allocating the same arange
         # tensors on every tree traversal / root operation.
@@ -344,6 +348,42 @@ class GPUMCTS:
         checkmate = no_moves & check
         return torch.where(checkmate, -torch.ones_like(states.halfmove_clock, dtype=torch.float32), torch.zeros_like(states.halfmove_clock, dtype=torch.float32))
 
+    def _third_repetition_paths(
+        self,
+        paths: torch.Tensor,
+        repetition_history: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mark selected leaves that are a third occurrence on their tree path.
+
+        ``repetition_history`` contains actual game-position hashes through the
+        root. Tree nodes retain compact board state but not a full history, so we
+        derive the necessary branch history from the selected root-to-leaf path.
+        This avoids adding per-node history storage and keeps inference batched.
+        """
+        if repetition_history.ndim != 2 or repetition_history.shape[0] != self.num_games:
+            raise ValueError("repetition_history must have shape [games, positions].")
+        b, g, depth = paths.shape
+        if repetition_history.shape[1] == 0:
+            return torch.zeros((b, g), dtype=torch.bool, device=self.device)
+
+        valid = paths >= 0
+        safe_nodes = paths.clamp_min(0).to(torch.long)
+        node_hashes = self._state_view(safe_nodes.reshape(-1)).state_hash().reshape(b, g, depth)
+        lengths = valid.sum(dim=2).clamp_min(1)
+        leaf_positions = (lengths - 1).to(torch.long)
+        leaf_hashes = node_hashes.gather(2, leaf_positions.unsqueeze(2)).squeeze(2)
+
+        historical_count = (
+            repetition_history.unsqueeze(0) == leaf_hashes.unsqueeze(2)
+        ).sum(dim=2)
+        depth_indices = torch.arange(depth, device=self.device).view(1, 1, depth)
+        branch_count = (
+            valid
+            & (depth_indices > 0)
+            & (node_hashes == leaf_hashes.unsqueeze(2))
+        ).sum(dim=2)
+        return (historical_count + branch_count) >= 3
+
     def _apply_virtual_loss(self, paths: torch.Tensor, loss: float = 1.0):
         """Reserve selected paths using temporary-only statistics."""
         nodes = paths.reshape(-1).to(torch.long)
@@ -413,6 +453,7 @@ class GPUMCTS:
         dirichlet_alpha: float | None = None,
         dirichlet_epsilon: float = 0.25,
         batch_size: int = 16,
+        repetition_history: torch.Tensor | None = None,
     ):
         """Run batched GPU MCTS.
 
@@ -434,6 +475,13 @@ class GPUMCTS:
         roots = self._root_ids
         self.model.eval()
         self._write_states(roots, root_states)
+
+        if repetition_history is not None:
+            repetition_history = repetition_history.to(
+                device=self.device, dtype=torch.int64
+            )
+            if repetition_history.ndim != 2 or repetition_history.shape[0] != games:
+                raise ValueError("repetition_history must have shape [games, positions].")
 
         logits, _, legal = self._evaluate(roots)
         self._expand(roots, logits, legal)
@@ -481,7 +529,19 @@ class GPUMCTS:
                 raise RuntimeError("Virtual value statistics were not fully removed.")
 
             flat_leaves = leaves.reshape(-1)
+            unique_leaves, leaf_counts = torch.unique(
+                flat_leaves, return_counts=True
+            )
+            duplicate_count = int((leaf_counts - 1).clamp_min(0).sum().item())
+            self.last_duplicate_leaf_count = duplicate_count
+            self.total_duplicate_leaf_count += duplicate_count
             terminal = self.terminal[flat_leaves]
+            if repetition_history is not None:
+                third_repetition = self._third_repetition_paths(paths, repetition_history)
+                repeated_leaves = flat_leaves[third_repetition.reshape(-1)]
+                if repeated_leaves.numel():
+                    self.terminal[repeated_leaves] = True
+                    terminal = self.terminal[flat_leaves]
             values = torch.zeros((flat_leaves.numel(),), dtype=torch.float32, device=self.device)
 
             t_ids = flat_leaves[terminal]
@@ -491,17 +551,21 @@ class GPUMCTS:
             nt_mask = ~terminal
             nt_ids = flat_leaves[nt_mask]
             if nt_ids.numel():
-                # One large NN + legal-move batch for the whole simulation batch.
-                logits, nn_values, legal = self._evaluate(nt_ids)
-                self._expand(nt_ids, logits, legal)
+                # A virtual-loss batch may still select the same leaf more than
+                # once. Evaluate/expand it exactly once, then fan out its value
+                # to every requested simulation so backup counts are preserved.
+                unique_nt_ids, inverse = torch.unique(nt_ids, sorted=True, return_inverse=True)
+                logits, unique_values, legal = self._evaluate(unique_nt_ids)
+                self._expand(unique_nt_ids, logits, legal)
                 no_moves = ~legal.any(dim=1)
-                nt_view = self._state_view(nt_ids)
+                nt_view = self._state_view(unique_nt_ids)
                 check = nt_view.is_in_check()
                 exact = torch.where(no_moves & check,
-                                    -torch.ones_like(nn_values),
-                                    torch.zeros_like(nn_values))
+                                    -torch.ones_like(unique_values),
+                                    torch.zeros_like(unique_values))
                 newly_terminal = no_moves | (nt_view.halfmove_clock >= 100) | nt_view.insufficient_material()
-                values[nt_mask] = torch.where(newly_terminal, exact, nn_values)
+                unique_leaf_values = torch.where(newly_terminal, exact, unique_values)
+                values[nt_mask] = unique_leaf_values[inverse]
 
             self._backup_batched(paths, values.reshape(bsz, games))
             remaining -= bsz

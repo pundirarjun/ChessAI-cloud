@@ -7,6 +7,10 @@ import re
 import shutil
 import tempfile
 import multiprocessing as mp
+import random
+from collections import Counter
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -38,14 +42,21 @@ from mcts.gpu_mcts import GPUMCTS
 # CONFIGURATION
 # ==========================================================
 
-NUM_GAMES = 300
+NUM_GAMES = 2
 
-NUM_SIMULATIONS = 100
+NUM_SIMULATIONS = 50
 
-MAX_MOVES = 400
+MAX_MOVES = 50
 
-# 0.0 = deterministic evaluation.
+# 0.0 = deterministic move selection.
 EVALUATION_TEMPERATURE = 0.25
+
+# Keep the existing stochastic default, while making reproducible benchmark
+# runs an explicit opt-in.  BENCHMARK_SEED is intentionally configurable rather
+# than baked into the evaluation logic.
+EVALUATION_SEED: Optional[int] = None
+BENCHMARK_MODE = False
+BENCHMARK_SEED: Optional[int] = 42
 
 ACTION_SPACE_SIZE = 4544
 
@@ -78,10 +89,117 @@ MODEL_B_CHECKPOINT = (
 
 
 # ==========================================================
+# EVALUATION IDENTITY / REPRODUCIBILITY
+# ==========================================================
+
+@dataclass(frozen=True)
+class EvaluationSettings:
+    temperature: float
+    seed: Optional[int]
+    benchmark_mode: bool
+
+
+@dataclass(frozen=True)
+class GameAssignment:
+    """The intended model identity for one globally numbered evaluation game."""
+
+    global_game_index: int
+    model_a_is_white: bool
+
+    @property
+    def model_a_color(self) -> str:
+        return "White" if self.model_a_is_white else "Black"
+
+    @property
+    def white_model_id(self) -> str:
+        return "A" if self.model_a_is_white else "B"
+
+    @property
+    def black_model_id(self) -> str:
+        return "B" if self.model_a_is_white else "A"
+
+
+def resolve_evaluation_settings(
+    temperature: Optional[float] = None,
+    seed: Optional[int] = None,
+    benchmark_mode: Optional[bool] = None,
+) -> EvaluationSettings:
+    """Resolve the explicit benchmark mode without changing stochastic defaults."""
+    benchmark = BENCHMARK_MODE if benchmark_mode is None else bool(benchmark_mode)
+    selected_temperature = EVALUATION_TEMPERATURE if temperature is None else float(temperature)
+    selected_seed = EVALUATION_SEED if seed is None else int(seed)
+
+    if benchmark:
+        selected_temperature = 0.0
+        if selected_seed is None:
+            selected_seed = BENCHMARK_SEED
+
+    if not 0.0 <= selected_temperature:
+        raise ValueError("Evaluation temperature must be non-negative.")
+    if benchmark and selected_seed is None:
+        raise ValueError("Deterministic benchmark mode requires a configured seed.")
+
+    return EvaluationSettings(
+        temperature=selected_temperature,
+        seed=selected_seed,
+        benchmark_mode=benchmark,
+    )
+
+
+def build_game_assignments(num_games: int, game_offset: int = 0) -> list[GameAssignment]:
+    """Assign alternating global games so the overall match is color balanced."""
+    if num_games < 0:
+        raise ValueError("num_games must be non-negative")
+    return [
+        GameAssignment(
+            global_game_index=game_offset + game,
+            model_a_is_white=(game_offset + game) % 2 == 0,
+        )
+        for game in range(num_games)
+    ]
+
+
+def _set_model_identity(model, model_id: str, checkpoint_path: str):
+    if model_id not in {"A", "B"}:
+        raise ValueError(f"Unknown evaluation model id: {model_id}")
+    model._evaluation_model_id = model_id
+    model._evaluation_checkpoint = os.path.abspath(checkpoint_path)
+    return model
+
+
+def _require_model_identity(model, expected_model_id: str):
+    actual_model_id = getattr(model, "_evaluation_model_id", None)
+    checkpoint = getattr(model, "_evaluation_checkpoint", None)
+    if actual_model_id != expected_model_id or not checkpoint:
+        raise RuntimeError(
+            "Evaluation model identity mismatch: "
+            f"expected {expected_model_id}, got {actual_model_id!r}."
+        )
+
+
+def select_assigned_model(model_a, model_b, assignment: GameAssignment, is_black: bool):
+    """Return the network dictated by model identity, not by a color variable."""
+    expected_model_id = assignment.black_model_id if is_black else assignment.white_model_id
+    model = model_a if expected_model_id == "A" else model_b
+    _require_model_identity(model, expected_model_id)
+    return model, expected_model_id
+
+
+def _seed_worker(seed: Optional[int], rank: int):
+    if seed is None:
+        return
+    worker_seed = int(seed) + int(rank)
+    random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(worker_seed)
+
+
+# ==========================================================
 # CREATE MODEL
 # ==========================================================
 
-def create_model(path, device):
+def create_model(path, device, model_id):
 
     model = ChessNet(
         action_space_size=ACTION_SPACE_SIZE
@@ -105,6 +223,7 @@ def create_model(path, device):
             memory_format=torch.channels_last
         )
 
+    _set_model_identity(model, model_id, path)
     return model, checkpoint
 
 
@@ -342,6 +461,8 @@ def search_batch(
     model,
     states: GPUChess,
     device,
+    temperature,
+    repetition_history=None,
 ):
     """
     Run one batched GPU MCTS search.
@@ -359,11 +480,12 @@ def search_batch(
 
     search.search(
         states,
-        num_simulations=NUM_SIMULATIONS
+        num_simulations=NUM_SIMULATIONS,
+        repetition_history=repetition_history,
     )
 
     actions = search.select_actions(
-        temperature=EVALUATION_TEMPERATURE
+        temperature=temperature
     )
 
     next_states = search.advance(
@@ -378,652 +500,163 @@ def search_batch(
 # ==========================================================
 
 def play_games(
-    white_model,
-    black_model,
+    model_a,
+    model_b,
     device,
     game_offset=0,
     num_games=None,
+    temperature=EVALUATION_TEMPERATURE,
 ):
-    """
-    Play num_games games simultaneously.
-
-    Games are grouped by side-to-move so positions using the same
-    neural network can be searched together.
-    """
-
+    """Play games with explicit A/B identity checks on every searched side."""
     if device.type != "cuda":
-        raise RuntimeError(
-            "GPU evaluation requires CUDA."
-        )
-
-    # ------------------------------------------------------
-    # Resolve number of games for this worker
-    # ------------------------------------------------------
-
+        raise RuntimeError("GPU evaluation requires CUDA.")
     if num_games is None:
         num_games = NUM_GAMES
 
-    # ------------------------------------------------------
-    # Master state
-    # ------------------------------------------------------
+    _require_model_identity(model_a, "A")
+    _require_model_identity(model_b, "B")
+    assignments = build_game_assignments(num_games, game_offset)
+    assignment_by_local_game = {a.global_game_index - game_offset: a for a in assignments}
 
-    states = GPUChess(
-        device,
-        num_games
-    )
-
-    # ------------------------------------------------------
-    # Per-game information
-    # ------------------------------------------------------
-
-    active = torch.ones(
-        num_games,
-        dtype=torch.bool,
-        device=device
-    )
-
+    states = GPUChess(device, num_games)
+    active = torch.ones(num_games, dtype=torch.bool, device=device)
     move_counts = [0] * num_games
-
-    repetition = [
-        {}
-        for _ in range(num_games)
-    ]
-
+    repetition = [{} for _ in range(num_games)]
+    # This history is retained on CUDA so GPUMCTS can recognize internal tree
+    # leaves that would be the third occurrence of an actual game position.
+    history = torch.empty((num_games, MAX_MOVES + 1), dtype=torch.int64, device=device)
     results = [None] * num_games
-
     termination = [None] * num_games
 
-    # ------------------------------------------------------
-    # Game color assignment
-    #
-    # Odd games:
-    #   model A = White
-    #   model B = Black
-    #
-    # Even games:
-    #   model B = White
-    #   model A = Black
-    # ------------------------------------------------------
+    def finish_terminal(active_indices, terminal, terminal_results, terminal_names):
+        terminal_local = torch.nonzero(terminal, as_tuple=False).flatten()
+        if terminal_local.numel() == 0:
+            return
+        terminal_global = active_indices[terminal_local]
+        for local, global_index in zip(
+            terminal_local.detach().cpu().tolist(),
+            terminal_global.detach().cpu().tolist(),
+        ):
+            results[global_index] = int(terminal_results[local].item())
+            termination[global_index] = terminal_names[local]
+            active[global_index] = False
 
-    model_a_is_white = [
-        (game_offset + game) % 2 == 0
-        for game in range(num_games)
-    ]
+    def advance_subset(subset_global, is_black: bool):
+        """Search one identity-homogeneous side batch and assert every choice."""
+        if subset_global.numel() == 0:
+            return
+        local_games = subset_global.detach().cpu().tolist()
+        assignments_for_subset = [assignment_by_local_game[g] for g in local_games]
+        selected_models = [
+            select_assigned_model(model_a, model_b, assignment, is_black)[0]
+            for assignment in assignments_for_subset
+        ]
+        selected_ids = [
+            select_assigned_model(model_a, model_b, assignment, is_black)[1]
+            for assignment in assignments_for_subset
+        ]
+        if len(set(selected_ids)) != 1 or any(model is not selected_models[0] for model in selected_models):
+            raise RuntimeError("Evaluation batch mixed model identities unexpectedly.")
+
+        subset_states = states.select(subset_global)
+        _, next_states = search_batch(
+            selected_models[0],
+            subset_states,
+            device,
+            temperature=temperature,
+            repetition_history=history[subset_global, :round_no],
+        )
+        copy_states(states, subset_global, next_states)
+        for game_index in local_games:
+            move_counts[game_index] += 1
 
     round_no = 0
-
-    # ======================================================
-    # MAIN GAME LOOP
-    # ======================================================
-
     while bool(active.any().item()):
-
         round_no += 1
-
-        # --------------------------------------------------
-        # Active game indices
-        # --------------------------------------------------
-
-        active_indices = (
-            torch.nonzero(
-                active,
-                as_tuple=False
-            )
-            .flatten()
-        )
-
+        active_indices = torch.nonzero(active, as_tuple=False).flatten()
         if active_indices.numel() == 0:
             break
+        active_states = states.select(active_indices)
 
-        active_states = states.select(
-            active_indices
-        )
-
-        # --------------------------------------------------
-        # THREEFOLD REPETITION
-        # --------------------------------------------------
-
-        hashes = (
-            active_states
-            .state_hash()
-            .detach()
-            .cpu()
-            .tolist()
-        )
-
-        active_list = (
-            active_indices
-            .detach()
-            .cpu()
-            .tolist()
-        )
-
-        repetition_finished = []
-
-        for local, game_index in enumerate(
-            active_list
-        ):
-
+        # Threefold detection remains the authoritative game-level rule.
+        hash_tensor = active_states.state_hash()
+        history[active_indices, round_no - 1] = hash_tensor
+        hashes = hash_tensor.detach().cpu().tolist()
+        for local, game_index in enumerate(active_indices.detach().cpu().tolist()):
             key = int(hashes[local])
-
-            count = (
-                repetition[game_index]
-                .get(key, 0)
-                + 1
-            )
-
-            repetition[game_index][key] = count
-
-            if count >= 3:
-
+            repetition[game_index][key] = repetition[game_index].get(key, 0) + 1
+            if repetition[game_index][key] >= 3:
                 results[game_index] = 0
-
-                termination[game_index] = (
-                    "THREEFOLD_REPETITION"
-                )
-
+                termination[game_index] = "THREEFOLD_REPETITION"
                 active[game_index] = False
 
-                repetition_finished.append(
-                    game_index
-                )
-
-        # --------------------------------------------------
-        # Refresh active indices
-        # --------------------------------------------------
-
-        active_indices = (
-            torch.nonzero(
-                active,
-                as_tuple=False
-            )
-            .flatten()
-        )
-
+        active_indices = torch.nonzero(active, as_tuple=False).flatten()
         if active_indices.numel() == 0:
             break
+        active_states = states.select(active_indices)
+        terminal, terminal_results, terminal_names = get_terminal_results(active_states)
+        finish_terminal(active_indices, terminal, terminal_results, terminal_names)
 
-        active_states = states.select(
-            active_indices
-        )
-
-        # --------------------------------------------------
-        # CHECK TERMINAL STATES
-        # --------------------------------------------------
-
-        terminal, terminal_results, terminal_names = (
-            get_terminal_results(
-                active_states
-            )
-        )
-
-        terminal_local = (
-            torch.nonzero(
-                terminal,
-                as_tuple=False
-            )
-            .flatten()
-        )
-
-        if terminal_local.numel() > 0:
-
-            terminal_global = (
-                active_indices[terminal_local]
-            )
-
-            for local, global_index in zip(
-                terminal_local.detach().cpu().tolist(),
-                terminal_global.detach().cpu().tolist()
-            ):
-
-                results[global_index] = int(
-                    terminal_results[local].item()
-                )
-
-                termination[global_index] = (
-                    terminal_names[local]
-                )
-
-                active[global_index] = False
-
-        # --------------------------------------------------
-        # Refresh after terminal states
-        # --------------------------------------------------
-
-        active_indices = (
-            torch.nonzero(
-                active,
-                as_tuple=False
-            )
-            .flatten()
-        )
-
+        active_indices = torch.nonzero(active, as_tuple=False).flatten()
         if active_indices.numel() == 0:
             break
-
-        active_states = states.select(
-            active_indices
-        )
-
-        # --------------------------------------------------
-        # MAX MOVE LIMIT
-        # --------------------------------------------------
-
-        too_long = []
-
-        for game_index in (
-            active_indices
-            .detach()
-            .cpu()
-            .tolist()
-        ):
-
+        for game_index in active_indices.detach().cpu().tolist():
             if move_counts[game_index] >= MAX_MOVES:
-
                 results[game_index] = None
-
-                termination[game_index] = (
-                    "MAX_MOVES"
-                )
-
+                termination[game_index] = "MAX_MOVES"
                 active[game_index] = False
 
-                too_long.append(
-                    game_index
-                )
-
-        # --------------------------------------------------
-        # Refresh after max-move removal
-        # --------------------------------------------------
-
-        active_indices = (
-            torch.nonzero(
-                active,
-                as_tuple=False
-            )
-            .flatten()
-        )
-
+        active_indices = torch.nonzero(active, as_tuple=False).flatten()
         if active_indices.numel() == 0:
             break
 
-        # ==================================================
-        # DETERMINE WHICH MODEL PLAYS EACH POSITION
-        # ==================================================
-
-        active_turns = states.turn[
-            active_indices
-        ]
-
-        # turn=False = White
-        # turn=True  = Black
-
-        white_games = []
-        black_games = []
-
-        active_list = (
-            active_indices
-            .detach()
-            .cpu()
-            .tolist()
-        )
-
-        for local, game_index in enumerate(
-            active_list
-        ):
-
-            is_black = bool(
-                active_turns[local].item()
-            )
-
-            if not is_black:
-                white_games.append(
-                    local
-                )
-            else:
-                black_games.append(
-                    local
-                )
-
-        # ==================================================
-        # WHITE MODEL BATCH
-        # ==================================================
-
-        if len(white_games) > 0:
-
-            local_indices = torch.tensor(
-                white_games,
-                dtype=torch.long,
-                device=device
-            )
-
-            global_indices = (
-                active_indices[
-                    local_indices
-                ]
-            )
-
-            white_states = states.select(
-                global_indices
-            )
-
-            # ------------------------------------------------
-            # Select model according to game color assignment
-            # ------------------------------------------------
-
-            model_a_indices = []
-            model_b_indices = []
-
-            global_list = (
-                global_indices
-                .detach()
-                .cpu()
-                .tolist()
-            )
-
-            for local, game_index in enumerate(
-                global_list
-            ):
-
-                if model_a_is_white[
-                    game_index
-                ]:
-                    model_a_indices.append(
-                        local
-                    )
-                else:
-                    model_b_indices.append(
-                        local
-                    )
-
-            # ----------------------------------------------
-            # Model A playing White
-            # ----------------------------------------------
-
-            if len(model_a_indices) > 0:
-
-                subset = torch.tensor(
-                    model_a_indices,
-                    dtype=torch.long,
-                    device=device
-                )
-
-                subset_global = (
-                    global_indices[subset]
-                )
-
-                subset_states = states.select(
-                    subset_global
-                )
-
-                _, next_states = search_batch(
-                    white_model,
-                    subset_states,
-                    device,
-                )
-
-                copy_states(
-                    states,
-                    subset_global,
-                    next_states
-                )
-
-                for game_index in (
-                    subset_global
-                    .detach()
-                    .cpu()
-                    .tolist()
-                ):
-                    move_counts[game_index] += 1
-
-            # ----------------------------------------------
-            # Model B playing White
-            # ----------------------------------------------
-
-            if len(model_b_indices) > 0:
-
-                subset = torch.tensor(
-                    model_b_indices,
-                    dtype=torch.long,
-                    device=device
-                )
-
-                subset_global = (
-                    global_indices[subset]
-                )
-
-                subset_states = states.select(
-                    subset_global
-                )
-
-                _, next_states = search_batch(
-                    black_model,
-                    subset_states,
-                    device,
-                )
-
-                copy_states(
-                    states,
-                    subset_global,
-                    next_states
-                )
-
-                for game_index in (
-                    subset_global
-                    .detach()
-                    .cpu()
-                    .tolist()
-                ):
-                    move_counts[game_index] += 1
-
-        # ==================================================
-        # BLACK MODEL BATCH
-        # ==================================================
-
-        if len(black_games) > 0:
-
-            local_indices = torch.tensor(
-                black_games,
-                dtype=torch.long,
-                device=device
-            )
-
-            global_indices = (
-                active_indices[
-                    local_indices
-                ]
-            )
-
-            model_a_indices = []
-            model_b_indices = []
-
-            global_list = (
-                global_indices
-                .detach()
-                .cpu()
-                .tolist()
-            )
-
-            for local, game_index in enumerate(
-                global_list
-            ):
-
-                if not model_a_is_white[
-                    game_index
-                ]:
-                    model_a_indices.append(
-                        local
-                    )
-                else:
-                    model_b_indices.append(
-                        local
-                    )
-
-            # ----------------------------------------------
-            # Model A playing Black
-            # ----------------------------------------------
-
-            if len(model_a_indices) > 0:
-
-                subset = torch.tensor(
-                    model_a_indices,
-                    dtype=torch.long,
-                    device=device
-                )
-
-                subset_global = (
-                    global_indices[subset]
-                )
-
-                subset_states = states.select(
-                    subset_global
-                )
-
-                _, next_states = search_batch(
-                    black_model,
-                    subset_states,
-                    device,
-                )
-
-                copy_states(
-                    states,
-                    subset_global,
-                    next_states
-                )
-
-                for game_index in (
-                    subset_global
-                    .detach()
-                    .cpu()
-                    .tolist()
-                ):
-                    move_counts[game_index] += 1
-
-            # ----------------------------------------------
-            # Model B playing Black
-            # ----------------------------------------------
-
-            if len(model_b_indices) > 0:
-
-                subset = torch.tensor(
-                    model_b_indices,
-                    dtype=torch.long,
-                    device=device
-                )
-
-                subset_global = (
-                    global_indices[subset]
-                )
-
-                subset_states = states.select(
-                    subset_global
-                )
-
-                _, next_states = search_batch(
-                    black_model,
-                    subset_states,
-                    device,
-                )
-
-                copy_states(
-                    states,
-                    subset_global,
-                    next_states
-                )
-
-                for game_index in (
-                    subset_global
-                    .detach()
-                    .cpu()
-                    .tolist()
-                ):
-                    move_counts[game_index] += 1
-
-        # ==================================================
-        # CHECK RESULTS AFTER MOVES
-        # ==================================================
-
-        active_indices = (
-            torch.nonzero(
-                active,
-                as_tuple=False
-            )
-            .flatten()
-        )
-
-        if active_indices.numel() > 0:
-
-            current_states = states.select(
-                active_indices
-            )
-
-            terminal, terminal_results, terminal_names = (
-                get_terminal_results(
-                    current_states
-                )
-            )
-
-            terminal_local = (
-                torch.nonzero(
-                    terminal,
-                    as_tuple=False
-                )
-                .flatten()
-            )
-
-            if terminal_local.numel() > 0:
-
-                terminal_global = (
-                    active_indices[
-                        terminal_local
+        active_turns = states.turn[active_indices]
+        white_local = [i for i, turn in enumerate(active_turns.detach().cpu().tolist()) if not turn]
+        black_local = [i for i, turn in enumerate(active_turns.detach().cpu().tolist()) if turn]
+
+        # Split each side-to-move batch by the model identity dictated by its
+        # assignment.  In particular, A-as-Black uses model_a, never model_b.
+        for is_black, local_indices in ((False, white_local), (True, black_local)):
+            if not local_indices:
+                continue
+            side_global = active_indices[
+                torch.tensor(local_indices, dtype=torch.long, device=device)
+            ]
+            a_local = []
+            b_local = []
+            for local, game_index in enumerate(side_global.detach().cpu().tolist()):
+                assignment = assignment_by_local_game[game_index]
+                expected = assignment.black_model_id if is_black else assignment.white_model_id
+                (a_local if expected == "A" else b_local).append(local)
+            for model_local in (a_local, b_local):
+                if model_local:
+                    subset_global = side_global[
+                        torch.tensor(model_local, dtype=torch.long, device=device)
                     ]
-                )
+                    advance_subset(subset_global, is_black=is_black)
 
-                for local, global_index in zip(
-                    terminal_local.detach().cpu().tolist(),
-                    terminal_global.detach().cpu().tolist()
-                ):
+        active_indices = torch.nonzero(active, as_tuple=False).flatten()
+        if active_indices.numel() > 0:
+            current_states = states.select(active_indices)
+            terminal, terminal_results, terminal_names = get_terminal_results(current_states)
+            finish_terminal(active_indices, terminal, terminal_results, terminal_names)
 
-                    results[global_index] = int(
-                        terminal_results[
-                            local
-                        ].item()
-                    )
-
-                    termination[
-                        global_index
-                    ] = terminal_names[local]
-
-                    active[global_index] = False
-
-        # ==================================================
-        # PROGRESS
-        # ==================================================
-
-        # print(
-        #     f"Evaluation round {round_no} | "
-        #     f"active games: "
-        #     f"{int(active.sum().item())}/{NUM_GAMES}",
-        #     flush=True,
-        # )
-
-    # ======================================================
-    # BUILD FINAL RESULTS
-    # ======================================================
-
-    final_results = []
-
-    for game_index in range(num_games):
-
-        final_results.append(
-            {
-                "result": results[game_index],
-                "termination": termination[game_index],
-                "moves": move_counts[game_index],
-            }
-        )
-
-    return final_results
+    model_a_checkpoint = getattr(model_a, "_evaluation_checkpoint")
+    model_b_checkpoint = getattr(model_b, "_evaluation_checkpoint")
+    return [
+        {
+            "global_game_index": assignment.global_game_index,
+            "result": results[local_game_index],
+            "termination": termination[local_game_index],
+            "moves": move_counts[local_game_index],
+            "model_a_color": assignment.model_a_color,
+            "white_model_id": assignment.white_model_id,
+            "black_model_id": assignment.black_model_id,
+            "model_a_checkpoint": model_a_checkpoint,
+            "model_b_checkpoint": model_b_checkpoint,
+        }
+        for local_game_index, assignment in enumerate(assignments)
+    ]
 
 
 
@@ -1039,6 +672,7 @@ def _evaluation_worker(
     model_a_checkpoint,
     model_b_checkpoint,
     output_path,
+    settings,
 ):
     """Run one evaluation shard entirely on one GPU.
 
@@ -1049,6 +683,7 @@ def _evaluation_worker(
 
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     torch.cuda.set_device(device_id)
+    _seed_worker(settings.seed, rank)
 
     device = torch.device(f"cuda:{device_id}")
 
@@ -1062,19 +697,22 @@ def _evaluation_worker(
     model_a, _ = create_model(
         model_a_checkpoint,
         device,
+        "A",
     )
 
     model_b, _ = create_model(
         model_b_checkpoint,
         device,
+        "B",
     )
 
     results = play_games(
-        white_model=model_a,
-        black_model=model_b,
+        model_a=model_a,
+        model_b=model_b,
         device=device,
         game_offset=game_offset,
         num_games=num_games,
+        temperature=settings.temperature,
     )
 
     torch.save(results, output_path)
@@ -1089,6 +727,10 @@ def _evaluation_worker(
 def play_games_multi_gpu(
     model_a_checkpoint,
     model_b_checkpoint,
+    *,
+    temperature=None,
+    seed=None,
+    benchmark_mode=None,
 ):
     """Run the evaluation across every visible CUDA GPU.
 
@@ -1100,6 +742,19 @@ def play_games_multi_gpu(
     GPUChess + GPUMCTS locally. Therefore both GPUs are active
     concurrently rather than one GPU handling all games.
     """
+
+    settings = resolve_evaluation_settings(
+        temperature=temperature,
+        seed=seed,
+        benchmark_mode=benchmark_mode,
+    )
+    if NUM_GAMES % 2 != 0:
+        raise ValueError(
+            "Color-balanced evaluation requires an even NUM_GAMES value."
+        )
+    assignments = build_game_assignments(NUM_GAMES)
+    if sum(a.model_a_is_white for a in assignments) != NUM_GAMES // 2:
+        raise RuntimeError("Model A color assignment is not balanced.")
 
     gpu_count = torch.cuda.device_count()
 
@@ -1123,6 +778,11 @@ def play_games_multi_gpu(
     print("Visible GPUs:", gpu_count)
     print("Workers:", workers)
     print("Games per GPU:", game_counts)
+    print("Benchmark mode:", settings.benchmark_mode)
+    print("Temperature:", settings.temperature)
+    print("Seed:", settings.seed)
+    print("Model A colors: White=", NUM_GAMES // 2, "Black=", NUM_GAMES // 2)
+    print("Model B colors: White=", NUM_GAMES // 2, "Black=", NUM_GAMES // 2)
 
     for device_id in range(gpu_count):
         print(
@@ -1161,6 +821,7 @@ def play_games_multi_gpu(
                     model_a_checkpoint,
                     model_b_checkpoint,
                     output_path,
+                    settings,
                 ),
             )
 
@@ -1237,20 +898,32 @@ def evaluate_models(
     # PRINT INDIVIDUAL GAMES
     # ======================================================
 
+    color_counts = Counter()
+    identity_pairs = Counter()
+
     for game_index, result in enumerate(
         results,
         start=1
     ):
-
-        if game_index % 2 == 1:
-            a_color = "White"
-        else:
-            a_color = "Black"
+        a_color = result["model_a_color"]
+        white_model_id = result["white_model_id"]
+        black_model_id = result["black_model_id"]
+        if {white_model_id, black_model_id} != {"A", "B"}:
+            raise RuntimeError(
+                f"Invalid evaluation identity pair in game {game_index}: "
+                f"White={white_model_id}, Black={black_model_id}."
+            )
+        expected_a_color = "White" if white_model_id == "A" else "Black"
+        if a_color != expected_a_color:
+            raise RuntimeError(f"Game {game_index} has inconsistent Model A color metadata.")
+        color_counts[a_color] += 1
+        identity_pairs[(white_model_id, black_model_id)] += 1
 
         print(
             f"Game {game_index}/{NUM_GAMES}: "
-            f"{name_a}={a_color} | "
-            f"{result}"
+            f"{name_a}={a_color} | White={white_model_id} "
+            f"Black={black_model_id} | result={result['result']} "
+            f"termination={result['termination']}"
         )
 
         total_moves += result["moves"]
@@ -1310,6 +983,11 @@ def evaluate_models(
         + draws
     )
 
+    if color_counts["White"] != color_counts["Black"]:
+        raise RuntimeError(f"Unbalanced colors in results: {dict(color_counts)}")
+    if identity_pairs[("A", "B")] != identity_pairs[("B", "A")]:
+        raise RuntimeError(f"Unbalanced model pairings in results: {dict(identity_pairs)}")
+
     if completed_games > 0:
 
         a_score = (
@@ -1326,11 +1004,6 @@ def evaluate_models(
 
         a_score = 0.0
         b_score = 0.0
-
-    elapsed = (
-        time.perf_counter()
-        - start_time
-    )
 
     # ======================================================
     # FINAL REPORT
@@ -1367,9 +1040,20 @@ def evaluate_models(
     )
 
     print(
+        "Model identity / color audit:",
+        f"A White/B Black={identity_pairs[('A', 'B')]} | "
+        f"B White/A Black={identity_pairs[('B', 'A')]}"
+    )
+
+    print(
+        "Score formula:",
+        "(wins + 0.5 * draws) / completed games; truncations excluded"
+    )
+
+    print(
         "Average moves:",
-        f"{total_moves / NUM_GAMES:.1f}"
-        if NUM_GAMES
+        f"{total_moves / len(results):.1f}"
+        if results
         else "0.0"
     )
 
@@ -1402,7 +1086,7 @@ def evaluate_models(
 
     print(
         "Games/second:",
-        f"{NUM_GAMES / elapsed:.3f}"
+        f"{len(results) / elapsed:.3f}"
         if elapsed > 0
         else "0.000"
     )
@@ -1425,6 +1109,8 @@ def evaluate_models(
 # ==========================================================
 
 if __name__ == "__main__":
+
+    evaluation_settings = resolve_evaluation_settings()
 
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -1472,7 +1158,17 @@ if __name__ == "__main__":
 
     print(
         "Temperature:",
-        EVALUATION_TEMPERATURE,
+        evaluation_settings.temperature,
+    )
+
+    print(
+        "Benchmark mode:",
+        evaluation_settings.benchmark_mode,
+    )
+
+    print(
+        "Seed:",
+        evaluation_settings.seed,
     )
 
     # ------------------------------------------------------
@@ -1543,6 +1239,9 @@ if __name__ == "__main__":
     results = play_games_multi_gpu(
         model_a_checkpoint=MODEL_A_CHECKPOINT,
         model_b_checkpoint=MODEL_B_CHECKPOINT,
+        temperature=evaluation_settings.temperature,
+        seed=evaluation_settings.seed,
+        benchmark_mode=evaluation_settings.benchmark_mode,
     )
 
     elapsed = (

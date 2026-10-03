@@ -1,6 +1,9 @@
 from collections import deque
 import random
 from collections import Counter
+import math
+
+import numpy as np
 
 
 class ReplayBuffer:
@@ -64,6 +67,67 @@ class ReplayBuffer:
                 print(f"UNKNOWN: {count:>7,} ({pct:6.2f}%)")
 
         print("============================================================\n")
+
+    def validate_provenance(
+        self,
+        *,
+        expected_max_iteration=None,
+        sample_limit=2048,
+    ):
+        """Validate a bounded, deterministic sample without changing replay data.
+
+        Historical three-tuples remain supported and are reported as unknown;
+        tagged samples may not claim to come from a future iteration.
+        """
+        total = len(self.buffer)
+        if total == 0:
+            raise RuntimeError("Replay buffer is empty.")
+
+        distribution = self.iteration_distribution()
+        known_iterations = [key for key in distribution if key != "unknown"]
+        if expected_max_iteration is not None:
+            future = [i for i in known_iterations if i > int(expected_max_iteration)]
+            if future:
+                raise RuntimeError(
+                    "Replay buffer contains samples newer than its expected "
+                    f"checkpoint: {sorted(future)} > RL{expected_max_iteration}."
+                )
+
+        # Evenly spaced indices make this deterministic and include old/new FIFO
+        # regions without allocating or shuffling the whole replay buffer.
+        checks = min(int(sample_limit), total)
+        indices = sorted({(i * (total - 1)) // max(1, checks - 1) for i in range(checks)})
+        for index in indices:
+            sample = self.buffer[index]
+            if len(sample) not in (3, 4):
+                raise RuntimeError(f"Replay sample {index} has invalid tuple length {len(sample)}.")
+            state, policy, value = sample[:3]
+            state_array = np.asarray(state)
+            policy_array = np.asarray(policy)
+            if state_array.shape != (18, 8, 8):
+                raise RuntimeError(
+                    f"Replay sample {index} has state shape {state_array.shape}, expected (18, 8, 8)."
+                )
+            if policy_array.shape != (4544,):
+                raise RuntimeError(
+                    f"Replay sample {index} has policy shape {policy_array.shape}, expected (4544,)."
+                )
+            if not np.isfinite(state_array).all() or not np.isfinite(policy_array).all():
+                raise RuntimeError(f"Replay sample {index} contains non-finite state or policy values.")
+            if np.any(policy_array < -1e-6) or not np.isclose(
+                float(policy_array.sum()), 1.0, atol=1e-4, rtol=1e-4
+            ):
+                raise RuntimeError(f"Replay sample {index} has an invalid policy target.")
+            value_float = float(value)
+            if not math.isfinite(value_float) or value_float not in (-1.0, 0.0, 1.0):
+                raise RuntimeError(f"Replay sample {index} has invalid value target {value!r}.")
+
+        return {
+            "total_samples": total,
+            "checked_samples": len(indices),
+            "source_distribution": dict(distribution),
+            "unknown_samples": int(distribution.get("unknown", 0)),
+        }
 
     def __len__(self):
         return len(self.buffer)

@@ -563,8 +563,8 @@ class GPUChess:
         is_ep = is_pawn & (df == 1) & (to == self.ep_square[state_idx])
         captured_sq = to + torch.where(
             turn,
-            torch.full_like(to, -8),
             torch.full_like(to, 8),
+            torch.full_like(to, -8),
         )
         captured_bit = self.square_bits[captured_sq.clamp(0, 63)]
         ep_white = is_ep & turn
@@ -636,15 +636,23 @@ class GPUChess:
         rights = torch.where((moving == ROOK) & turn & (frm == 56), rights & ~BQ, rights)
         rights = torch.where((moving == ROOK) & turn & (frm == 63), rights & ~BK, rights)
 
-        # Captured rook on home square. Inspect the original position in one
-        # batched expression rather than looping over four cases.
-        # Preserve the existing engine's castling-right semantics while removing
-        # the four Python loops. (A captured rook clears that color's rook-side
-        # rights regardless of its capture square, matching the previous engine.)
-        captured_rook_w = (original[:, ROOK] & tb) != 0
-        captured_rook_b = (original[:, 6 + ROOK] & tb) != 0
-        rights = torch.where(captured_rook_w, rights & ~(WQ | WK), rights)
-        rights = torch.where(captured_rook_b, rights & ~(BQ | BK), rights)
+        # A captured rook removes only the castling right associated with that
+        # original home square.  In particular, capturing a promoted rook must
+        # not erase the right belonging to an untouched a/h-file rook.
+        captured_white_rook = (original[:, ROOK] & tb) != 0
+        captured_black_rook = (original[:, 6 + ROOK] & tb) != 0
+        rights = torch.where(
+            captured_white_rook & (to == 0), rights & ~WQ, rights
+        )
+        rights = torch.where(
+            captured_white_rook & (to == 7), rights & ~WK, rights
+        )
+        rights = torch.where(
+            captured_black_rook & (to == 56), rights & ~BQ, rights
+        )
+        rights = torch.where(
+            captured_black_rook & (to == 63), rights & ~BK, rights
+        )
         new.castling = rights
 
         # En-passant target after a double pawn move.
@@ -736,8 +744,49 @@ class GPUChess:
         bishop_dead = both_bishops & only_bishops & same_color
         return basic | bishop_dead
 
+    def _legal_en_passant_available(self) -> torch.Tensor:
+        """Whether an en-passant capture is legal in each current position.
+
+        FIDE repetition identity retains en-passant state only when that right
+        changes the legal moves.  This tests only candidate EP captures and the
+        usual king-safety validation, rather than materializing every legal move.
+        """
+        b = self.pieces.shape[0]
+        has_ep = self.ep_square >= 0
+        if not bool(has_ep.any().item()):
+            return torch.zeros((b,), dtype=torch.bool, device=self.device)
+
+        pawn_bb = torch.where(self.turn, self.pieces[:, 6 + PAWN], self.pieces[:, PAWN])
+        has_source = (pawn_bb[:, None] & self.from_bits[None, :]) != 0
+        candidate_geometry = torch.where(
+            (~self.turn)[:, None], self.w_capture[None, :], self.b_capture[None, :]
+        )
+        candidates = has_source & candidate_geometry
+        candidates &= self.to_sq[None, :] == self.ep_square[:, None]
+
+        # Verify that the pawn which may be captured actually exists behind the
+        # EP target. Valid game states guarantee this, but retaining the check
+        # makes the repetition key robust for manually constructed test states.
+        captured_sq = self.ep_square.to(torch.long) + torch.where(
+            self.turn,
+            torch.full_like(self.ep_square, 8, dtype=torch.long),
+            torch.full_like(self.ep_square, -8, dtype=torch.long),
+        )
+        captured_sq = captured_sq.clamp(0, 63)
+        captured_bit = self.square_bits[captured_sq]
+        enemy_pawns = torch.where(self.turn, self.pieces[:, PAWN], self.pieces[:, 6 + PAWN])
+        candidates &= ((enemy_pawns & captured_bit) != 0)[:, None]
+
+        flat = torch.nonzero(candidates, as_tuple=False)
+        available = torch.zeros((b,), dtype=torch.bool, device=self.device)
+        if flat.numel() == 0:
+            return available
+        legal = self._validate_actions(flat[:, 0], flat[:, 1])
+        available[flat[:, 0][legal]] = True
+        return available
+
     def state_hash(self) -> torch.Tensor:
-        """Deterministic compact position key for repetition tracking."""
+        """Deterministic compact repetition key with legal EP semantics."""
         coeffs = [
             0x9E3779B97F4A7C15, 0xBF58476D1CE4E5B,
             0x94D049BB133111EB, 0x369DEA0F31A53F85,
@@ -750,6 +799,14 @@ class GPUChess:
         for i, c in enumerate(coeffs):
             h = h ^ (self.pieces[:, i] * _signed_u64(c))
         h = h ^ (self.castling.to(torch.int64) * _signed_u64(0x517CC1B727220A95))
-        h = h ^ ((self.ep_square.to(torch.int64) + 1) * _signed_u64(0x6A09E667F3BCC909))
+        # An unavailable EP target is ignored: it does not create a different
+        # position for threefold-repetition purposes.
+        legal_ep = self._legal_en_passant_available()
+        ep_for_hash = torch.where(
+            legal_ep,
+            self.ep_square.to(torch.int64) + 1,
+            torch.zeros_like(self.ep_square, dtype=torch.int64),
+        )
+        h = h ^ (ep_for_hash * _signed_u64(0x6A09E667F3BCC909))
         h = h ^ (self.turn.to(torch.int64) * _signed_u64(0xBB67AE8584CAA73B))
         return h

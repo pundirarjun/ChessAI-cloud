@@ -198,6 +198,7 @@ def _play_games_gpu(
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
             batch_size=batch_size,
+            repetition_history=history[active_idx, :round_no],
         )
         policies = search.root_visit_policy()
 
