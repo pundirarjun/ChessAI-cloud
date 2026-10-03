@@ -84,7 +84,7 @@ MODEL_A_CHECKPOINT = (
 
 
 MODEL_B_CHECKPOINT = (
-    "/kaggle/input/datasets/arjunthakur9999/checkpoints/chess_checkpoints (4)/rl_iteration_50.pt"
+    "/kaggle/input/datasets/arjunthakur9999/checkpoints/chess_checkpoints (3)/rl_iteration_50.pt"
 )
 
 
