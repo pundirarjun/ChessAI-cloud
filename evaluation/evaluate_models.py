@@ -49,13 +49,13 @@ NUM_SIMULATIONS = 100
 MAX_MOVES = 400
 
 # 0.0 = deterministic move selection.
-EVALUATION_TEMPERATURE = 0.0
+EVALUATION_TEMPERATURE = 0.25
 
 # Keep the existing stochastic default, while making reproducible benchmark
 # runs an explicit opt-in.  BENCHMARK_SEED is intentionally configurable rather
 # than baked into the evaluation logic.
-EVALUATION_SEED: Optional[int] = None
-BENCHMARK_MODE = True
+EVALUATION_SEED: Optional[int] = 42
+BENCHMARK_MODE = False
 BENCHMARK_SEED: Optional[int] = 42
 
 ACTION_SPACE_SIZE = 4544
