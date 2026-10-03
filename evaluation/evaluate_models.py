@@ -42,7 +42,7 @@ from mcts.gpu_mcts import GPUMCTS
 # CONFIGURATION
 # ==========================================================
 
-NUM_GAMES = 5
+NUM_GAMES = 6
 
 NUM_SIMULATIONS = 50
 
