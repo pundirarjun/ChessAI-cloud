@@ -90,6 +90,7 @@ def _play_games_gpu(
     max_moves=200,
     temperature=1.0,
     temperature_moves=20,
+    late_temperature=0.0,
     dirichlet_alpha=0.3,
     dirichlet_epsilon=0.25,
     batch_size=128,
@@ -237,7 +238,9 @@ def _play_games_gpu(
             diagnostic_max_prob_bins["0.60-0.80"] += int(((max_prob >= 0.60) & (max_prob < 0.80)).sum().item())
             diagnostic_max_prob_bins[">=0.80"] += int((max_prob >= 0.80).sum().item())
 
-        current_temperature = temperature if round_no <= temperature_moves else 0.10
+        current_temperature = (
+            temperature if round_no <= temperature_moves else late_temperature
+        )
         actions = search.select_actions(current_temperature)
         next_states = search.advance(actions)
         sample_policies[active_idx, sample_pos] = policies
@@ -407,10 +410,12 @@ def _multi_gpu_self_play_worker(
     max_moves: int,
     temperature: float,
     temperature_moves: int,
+    late_temperature: float,
     dirichlet_alpha: float,
     dirichlet_epsilon: float,
     batch_size: int,
     seed: int,
+    model_kwargs: Optional[dict] = None,
 ):
     """Run one independent self-play shard on one CUDA device.
 
@@ -430,7 +435,9 @@ def _multi_gpu_self_play_worker(
     from environment.action_encoder import ActionEncoder
 
     encoder = ActionEncoder()
-    model = ChessNet(action_space_size=encoder.size()).to(
+    model_kwargs = dict(model_kwargs or {})
+    model_kwargs.setdefault("action_space_size", encoder.size())
+    model = ChessNet(**model_kwargs).to(
         torch.device(f"cuda:{device_id}")
     )
     model.to(memory_format=torch.channels_last)
@@ -454,6 +461,7 @@ def _multi_gpu_self_play_worker(
         max_moves=max_moves,
         temperature=temperature,
         temperature_moves=temperature_moves,
+        late_temperature=late_temperature,
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
         batch_size=batch_size,
@@ -474,10 +482,12 @@ def play_games_multi_gpu(
     max_moves=200,
     temperature=1.0,
     temperature_moves=20,
+    late_temperature=0.0,
     dirichlet_alpha=0.3,
     dirichlet_epsilon=0.25,
     batch_size=128,
     seed=42,
+    model_kwargs: Optional[dict] = None,
 ):
     """Split self-play across all visible CUDA GPUs.
 
@@ -497,6 +507,7 @@ def play_games_multi_gpu(
             max_moves=max_moves,
             temperature=temperature,
             temperature_moves=temperature_moves,
+            late_temperature=late_temperature,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
             batch_size=batch_size,
@@ -511,6 +522,7 @@ def play_games_multi_gpu(
             max_moves=max_moves,
             temperature=temperature,
             temperature_moves=temperature_moves,
+            late_temperature=late_temperature,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
             batch_size=batch_size,
@@ -557,10 +569,12 @@ def play_games_multi_gpu(
                     max_moves,
                     temperature,
                     temperature_moves,
+                    late_temperature,
                     dirichlet_alpha,
                     dirichlet_epsilon,
                     batch_size,
                     seed + rank,
+                    model_kwargs,
                 ),
             )
             process.start()
@@ -605,6 +619,7 @@ def play_games(
     max_moves=200,
     temperature=1.0,
     temperature_moves=20,
+    late_temperature=0.0,
     dirichlet_alpha=0.3,
     dirichlet_epsilon=0.25,
     batch_size=128,
@@ -618,6 +633,7 @@ def play_games(
             max_moves=max_moves,
             temperature=temperature,
             temperature_moves=temperature_moves,
+            late_temperature=late_temperature,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
             batch_size=batch_size,
@@ -632,6 +648,7 @@ def play_games(
         max_moves=max_moves,
         temperature=temperature,
         temperature_moves=temperature_moves,
+        late_temperature=late_temperature,
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
         batch_size=batch_size,
@@ -644,6 +661,7 @@ def play_game(
     max_moves=200,
     temperature=1.0,
     temperature_moves=20,
+    late_temperature=0.0,
     dirichlet_alpha=0.3,
     dirichlet_epsilon=0.25,
     batch_size=128,
@@ -655,6 +673,7 @@ def play_game(
         max_moves=max_moves,
         temperature=temperature,
         temperature_moves=temperature_moves,
+        late_temperature=late_temperature,
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
         batch_size=batch_size,

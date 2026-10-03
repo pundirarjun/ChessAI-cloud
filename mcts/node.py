@@ -47,6 +47,7 @@ class Node:
         # ==================================================
 
         self.virtual_visit_count = 0
+        self.virtual_value_sum = 0.0
 
         # ==================================================
         # CHILDREN
@@ -206,13 +207,22 @@ class Node:
             1
         )
 
-        # During batched MCTS, virtual visits temporarily
-        # increase this count so that another simulation is
-        # discouraged from selecting exactly the same path.
-
+        # During batched MCTS, virtual statistics are deliberately kept
+        # separate from real MCTS counts and value sums. They discourage a
+        # duplicate leaf reservation without contaminating policy targets or
+        # the real Q estimate after backup.
         child_visit_count = (
             self.visit_count
             + self.virtual_visit_count
+        )
+        effective_value_sum = (
+            self.value_sum
+            + self.virtual_value_sum
+        )
+        effective_value = (
+            effective_value_sum / child_visit_count
+            if child_visit_count > 0
+            else 0.0
         )
 
         # ==================================================
@@ -235,7 +245,7 @@ class Node:
         # ==================================================
 
         return (
-            -self.value
+            -effective_value
             + exploration
         )
 
@@ -317,6 +327,7 @@ class Node:
             if node.virtual_visit_count > 0:
 
                 node.virtual_visit_count -= 1
+                node.virtual_value_sum -= 1.0
 
             # ==================================================
             # ADD REAL VISIT
@@ -342,6 +353,12 @@ class Node:
 
             node = node.parent
 
+    def apply_virtual_loss(self, loss=1.0):
+        """Temporarily reserve a path without changing real MCTS statistics."""
+
+        self.virtual_visit_count += 1
+        self.virtual_value_sum += float(loss)
+
     # ======================================================
     # RESET VIRTUAL VISITS
     #
@@ -355,6 +372,7 @@ class Node:
     def clear_virtual_visits(self):
 
         self.virtual_visit_count = 0
+        self.virtual_value_sum = 0.0
 
         for child in self.children.values():
 

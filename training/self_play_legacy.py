@@ -222,6 +222,8 @@ def play_games(
 
     temperature_moves=20,
 
+    late_temperature=0.0,
+
     dirichlet_alpha=0.3,
 
     dirichlet_epsilon=0.25,
@@ -468,7 +470,7 @@ def play_games(
 
             else:
 
-                current_temperature = 0.0
+                current_temperature = late_temperature
 
             # --------------------------------------------------
             # Select move.
@@ -643,6 +645,8 @@ def play_game(
 
     temperature_moves=20,
 
+    late_temperature=0.0,
+
     dirichlet_alpha=0.3,
 
     dirichlet_epsilon=0.25,
@@ -664,6 +668,8 @@ def play_game(
         temperature=temperature,
 
         temperature_moves=temperature_moves,
+
+        late_temperature=late_temperature,
 
         dirichlet_alpha=dirichlet_alpha,
 

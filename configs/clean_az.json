@@ -1,0 +1,66 @@
+{
+  "architecture": {
+    "action_space_size": 4544,
+    "channels": 128,
+    "input_channels": 18,
+    "policy_channels": 32,
+    "residual_blocks": 8,
+    "value_channels": 32
+  },
+  "evaluation": {
+    "confidence_level": 0.95,
+    "games": 40,
+    "include_truncations": false,
+    "max_moves": 400,
+    "min_completed_games": 32,
+    "promotion_score": 0.55,
+    "simulations": 400,
+    "temperature": 0.0
+  },
+  "mcts": {
+    "batch_size": 32,
+    "c_puct": 1.5,
+    "engine": "cpp",
+    "max_tree_nodes": null,
+    "simulations": 400
+  },
+  "run_name": "clean_az_v1",
+  "runtime": {
+    "allow_tf32": true,
+    "cpu_test_mode": false,
+    "deterministic": false,
+    "num_gpus": 2,
+    "seed": 42
+  },
+  "self_play": {
+    "dirichlet_alpha": 0.3,
+    "dirichlet_epsilon": 0.25,
+    "late_temperature": 0.0,
+    "max_moves": 400,
+    "num_games": 256,
+    "temperature": 1.0,
+    "temperature_moves": 30,
+    "workers_per_gpu": 1
+  },
+  "storage": {
+    "checkpoint_frequency": 1,
+    "iteration_checkpoint_retention": 5,
+    "replay_capacity": 150000,
+    "replay_retention": 1,
+    "run_root": "runs/clean_az"
+  },
+  "training": {
+    "batch_size": 256,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "channels_last": true,
+    "gradient_clip_norm": 1.0,
+    "learning_rate": 0.0005,
+    "mixed_precision": true,
+    "momentum": 0.9,
+    "optimizer": "adamw",
+    "scheduler": "none",
+    "steps": 1200,
+    "weight_decay": 0.0001
+  }
+}

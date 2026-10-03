@@ -310,7 +310,7 @@ class MCTS:
                     break
 
                 for node in path:
-                    node.virtual_visit_count += 1
+                    node.apply_virtual_loss()
 
                 leaves.append(leaf)
                 paths.append(path)
@@ -569,7 +569,7 @@ class MCTS:
                         continue
 
                     for node in path:
-                        node.virtual_visit_count += 1
+                        node.apply_virtual_loss()
 
                     leaves.append(
                         leaf
