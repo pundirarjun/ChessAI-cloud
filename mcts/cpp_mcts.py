@@ -44,6 +44,8 @@ class CppMctsAdapter:
             if device is not None
             else next(model.parameters()).device
         )
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.action_encoder = action_encoder
         if action_encoder is not None and action_encoder.size() != 4544:
             raise ValueError("CppMctsAdapter requires the 4544-action space.")

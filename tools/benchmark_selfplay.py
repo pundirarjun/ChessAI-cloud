@@ -265,7 +265,7 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this benchmark.")
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Engine: {args.engine}")
 

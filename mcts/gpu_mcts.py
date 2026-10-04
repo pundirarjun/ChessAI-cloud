@@ -33,6 +33,8 @@ class GPUMCTS:
     ):
         self.model = model
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.action_encoder = action_encoder
         if self.action_encoder is not None and self.action_encoder.size() != 4544:
             raise ValueError("GPUMCTS requires the project's 4544-action space.")
