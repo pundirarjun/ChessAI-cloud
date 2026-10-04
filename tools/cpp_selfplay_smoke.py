@@ -78,7 +78,7 @@ def check_sanity(tag: str, results):
                               "INSUFFICIENT_MATERIAL", "THREEFOLD_REPETITION"},
             r.termination,
         )
-        check(f"{tag}: game {i} result in {{0,1,2}}", r.result in (0, 1, 2),
+        check(f"{tag}: game {i} result in {{-1,0,1}}", r.result in (-1, 0, 1),
               str(r.result))
         completed += int(r.completed)
         total_samples += len(r.training_data)
