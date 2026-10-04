@@ -59,7 +59,8 @@ class TrainingConfig:
 class EvaluationConfig:
     games: int = 40
     simulations: int = 400
-    temperature: float = 0.0
+    temperature: float = 1.0
+    temperature_moves: int = 30
     max_moves: int = 400
     confidence_level: float = 0.95
     min_completed_games: int = 32
@@ -133,6 +134,8 @@ class RunConfig:
             raise ValueError("evaluation requires at least 100 simulations.")
         if self.evaluation.temperature < 0:
             raise ValueError("evaluation temperature must be non-negative.")
+        if self.evaluation.temperature_moves < 0:
+            raise ValueError("evaluation temperature_moves must be non-negative.")
         if not 0 < self.evaluation.confidence_level < 1:
             raise ValueError("confidence_level must be in (0, 1).")
         if not 0.5 <= self.evaluation.promotion_score <= 1:

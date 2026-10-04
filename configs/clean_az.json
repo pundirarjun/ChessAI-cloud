@@ -15,7 +15,8 @@
     "min_completed_games": 32,
     "promotion_score": 0.55,
     "simulations": 400,
-    "temperature": 0.0
+    "temperature": 1.0,
+    "temperature_moves": 30
   },
   "mcts": {
     "batch_size": 32,

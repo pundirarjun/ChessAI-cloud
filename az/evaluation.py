@@ -28,8 +28,11 @@ def evaluate_candidate(
 ) -> tuple[list[EvaluationGame], GateDecision]:
     """Evaluate candidate and best at identical search settings.
 
-    Evaluation has no Dirichlet noise. Every game has an assigned color and
-    seed, and max-move truncations remain None rather than becoming draws.
+    The first ``temperature_moves`` plies are sampled at ``temperature`` so
+    games diversify instead of collapsing into identical deterministic
+    shuffles; later play is deterministic. Evaluation has no Dirichlet noise.
+    Every game has an assigned color and seed, and max-move truncations
+    remain None rather than becoming draws.
     """
 
     config.validate()
@@ -130,7 +133,11 @@ def _play_one(
             batch_size=config.mcts.batch_size,
             repetition_history=repetition_history,
         )
-        action = search.select_actions(config.evaluation.temperature)
+        action = search.select_actions(
+            config.evaluation.temperature
+            if _move < config.evaluation.temperature_moves
+            else 0.0
+        )
         state = search.advance(action)
     else:
         white_result, termination = None, "MAX_MOVES"
