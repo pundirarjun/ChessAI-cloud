@@ -6,6 +6,17 @@ PROJECT_ROOT="${1:-/kaggle/working/ChessAI-cloud}"
 CONFIG="${2:-$PROJECT_ROOT/configs/clean_az.json}"
 cd "$PROJECT_ROOT"
 
+# ---------------------------------------------------------------
+# 0. Session persistence.  Kaggle wipes /kaggle/working when a
+#    session stops (only 19 GB is provided anyway), so run state
+#    (checkpoints, replay, manifest) is restored from a Kaggle
+#    Dataset before anything else and re-uploaded after every
+#    iteration.  No-op outside Kaggle notebooks or with PERSIST=0.
+# ---------------------------------------------------------------
+echo "[disk] working dir free: $(df -h "$PROJECT_ROOT" | awk 'NR==2{print $4}') / 19G"
+bash "$PROJECT_ROOT/scripts/kaggle_persist.sh" restore "$PROJECT_ROOT" \
+  || echo "[persist] restore failed; continuing with whatever run state is local"
+
 python -m pip install --quiet -r requirements.txt pytest pybind11
 
 # ---------------------------------------------------------------
@@ -36,7 +47,7 @@ python -m pytest -q tests_clean tests
 #    it; on re-runs we keep the existing manifest (provenance) and
 #    let preflight verify the config hash still matches.
 # ---------------------------------------------------------------
-RUN_MANIFEST="$(python -c "import sys; from az.config import RunConfig; from az.provenance import MANIFEST_NAME; print(RunConfig.load_json(sys.argv[1]).root / MANIFEST_NAME)" "$CONFIG")"
+RUN_MANIFEST="$(python -c "import sys; from az.config import RunConfig; from az.provenance import MANIFEST_NAME; print((RunConfig.load_json(sys.argv[1]).root / MANIFEST_NAME).as_posix())" "$CONFIG")"
 if [ -f "$RUN_MANIFEST" ]; then
   echo "Reusing existing clean run manifest: $RUN_MANIFEST"
 else
@@ -59,7 +70,27 @@ python tools/benchmark_selfplay.py --engine cpp --sims 100,200,400,800 \
   --require-games-per-hour 50 \
   --json-out "$PROJECT_ROOT/kaggle_cpp_benchmark.json"
 
-# This is intentionally the only command that starts iteration 1. It remains
-# blocked until every preceding validation, including the compiled C++ engine
-# and the performance gate, succeeds.
-python clean_az.py iteration --config "$CONFIG"
+# ---------------------------------------------------------------
+# 6. Iterations.  Each iteration is gated on >=5 GB free space so
+#    the 19 GB working dir never fills mid-write, and is uploaded
+#    to the Kaggle Dataset immediately afterwards so stopping the
+#    session loses at most the in-flight iteration.  Run multiple
+#    iterations per session with:  ITERATIONS=5 bash scripts/...
+# ---------------------------------------------------------------
+FREE_KB="$(df -k "$PROJECT_ROOT" | awk 'NR==2{print $4}')"
+if [ "$FREE_KB" -lt $((5 * 1024 * 1024)) ]; then
+  echo "ERROR: only $((FREE_KB / 1024 / 1024)) GB free (<5 GB); free space before training." >&2
+  exit 1
+fi
+echo "[disk] before iterations: $((FREE_KB / 1024 / 1024)) GB free"
+RUN_DIR="$(python -c "import sys; from az.config import RunConfig; print(RunConfig.load_json(sys.argv[1]).root.as_posix())" "$CONFIG")"
+ITERATIONS="${ITERATIONS:-1}"
+for it in $(seq 1 "$ITERATIONS"); do
+  echo "=== iteration step $it/$ITERATIONS ==="
+  # Blocked until every preceding validation, including the compiled
+  # C++ engine and the performance gate, succeeds.
+  python clean_az.py iteration --config "$CONFIG"
+  bash "$PROJECT_ROOT/scripts/kaggle_persist.sh" save "$PROJECT_ROOT" \
+    || echo "[persist] save failed; this iteration lives only in the current session"
+  echo "[disk] after iteration $it: $(df -h "$PROJECT_ROOT" | awk 'NR==2{print $4}') free | run state: $(du -sh "$RUN_DIR" 2>/dev/null | awk '{print $1}')"
+done
