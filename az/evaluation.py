@@ -30,9 +30,10 @@ def evaluate_candidate(
 
     The first ``temperature_moves`` plies are sampled at ``temperature`` so
     games diversify instead of collapsing into identical deterministic
-    shuffles; later play is deterministic. Evaluation has no Dirichlet noise.
-    Every game has an assigned color and seed, and max-move truncations
-    remain None rather than becoming draws.
+    shuffles; setting ``temperature_moves >= max_moves`` samples the whole
+    game (the default), which is what keeps completion rates high without
+    Dirichlet noise. Every game has an assigned color and seed, and
+    max-move truncations remain None rather than becoming draws.
     """
 
     config.validate()

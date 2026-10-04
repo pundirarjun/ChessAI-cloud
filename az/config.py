@@ -57,10 +57,10 @@ class TrainingConfig:
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    games: int = 40
+    games: int = 48
     simulations: int = 400
     temperature: float = 1.0
-    temperature_moves: int = 30
+    temperature_moves: int = 400
     max_moves: int = 400
     confidence_level: float = 0.95
     min_completed_games: int = 32

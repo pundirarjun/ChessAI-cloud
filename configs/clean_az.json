@@ -9,14 +9,14 @@
   },
   "evaluation": {
     "confidence_level": 0.95,
-    "games": 40,
+    "games": 48,
     "include_truncations": false,
     "max_moves": 400,
     "min_completed_games": 32,
     "promotion_score": 0.55,
     "simulations": 400,
     "temperature": 1.0,
-    "temperature_moves": 30
+    "temperature_moves": 400
   },
   "mcts": {
     "batch_size": 32,
