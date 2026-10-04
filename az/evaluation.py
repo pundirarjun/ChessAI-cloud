@@ -42,6 +42,11 @@ def evaluate_candidate(
     else:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         games = _evaluate_local(root, config, manifest, device, range(config.evaluation.games))
+    print(
+        f"[eval] {len(games)} games done (engine={config.mcts.engine}, "
+        f"{config.evaluation.simulations} sims)",
+        flush=True,
+    )
     decision = evaluate_gate(
         games,
         promotion_score=config.evaluation.promotion_score,
@@ -64,16 +69,28 @@ def _evaluate_local(
     load_checkpoint(root=root, manifest=manifest, role="candidate", model=candidate, map_location=device)
     best.eval()
     candidate.eval()
-    return [
-        _play_one(
+    print(
+        f"[eval] playing {len(list(game_indices))} games on {device} "
+        f"@ {config.evaluation.simulations} sims "
+        f"(engine={config.mcts.engine})",
+        flush=True,
+    )
+    games = []
+    for game_id in game_indices:
+        game = _play_one(
             candidate=candidate,
             best=best,
             config=config,
             game_id=game_id,
             device=device,
         )
-        for game_id in game_indices
-    ]
+        games.append(game)
+        print(
+            f"[eval] game {game.game_id} ({game.candidate_color}): "
+            f"{game.termination} result={game.result_for_candidate}",
+            flush=True,
+        )
+    return games
 
 
 def _play_one(
@@ -105,7 +122,7 @@ def _play_one(
             break
         white_to_move = not bool(state.turn[0].item())
         active_model = candidate if white_to_move == candidate_is_white else best
-        search = GPUMCTS(model=active_model, device=device, c_puct=config.mcts.c_puct)
+        search = _make_search(active_model, config, device, seed + _move)
         repetition_history = torch.tensor([history], dtype=torch.int64, device=device)
         search.search(
             state,
@@ -130,6 +147,21 @@ def _play_one(
         simulations=config.evaluation.simulations,
         temperature=config.evaluation.temperature,
     )
+
+
+def _make_search(model, config: RunConfig, device: torch.device, seed: int):
+    """Evaluation uses the configured engine; both are behaviorally identical
+    (trajectory-proven in tools/cpp_selfplay_smoke.py --parity)."""
+    engine = config.mcts.engine
+    if engine == "cpp":
+        from mcts.cpp_mcts import CppMctsAdapter
+
+        return CppMctsAdapter(
+            model=model, device=device, c_puct=config.mcts.c_puct, seed=seed
+        )
+    if engine == "python_gpu_reference":
+        return GPUMCTS(model=model, device=device, c_puct=config.mcts.c_puct)
+    raise ValueError(f"Unknown MCTS engine: {engine!r}")
 
 
 def _terminal_result(state: GPUChess) -> tuple[int, str] | None:
