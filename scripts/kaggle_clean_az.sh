@@ -11,8 +11,14 @@ python -m pip install --quiet -r requirements.txt pytest pybind11
 # ---------------------------------------------------------------
 # 1. Build the C++ MCTS engine (az_cpp_mcts) before anything that
 #    imports it.  Output lands in the repo root, which is on sys.path.
+#    A stale build directory from another OS/architecture (the repo
+#    previously tracked cpp/build with a Windows CMakeCache.txt)
+#    breaks configure, so always start from a clean build tree and
+#    never ship prebuilt module binaries.
 # ---------------------------------------------------------------
 python -m pip install --quiet cmake ninja
+rm -rf cpp/build
+rm -f az_cpp_mcts*.pyd az_cpp_mcts*.so az_cpp_mcts*.dylib
 cmake -S cpp -B cpp/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"

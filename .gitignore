@@ -13,3 +13,11 @@ runs/
 .env
 
 data/pgn/lichess_2013_01.pgn
+
+# C++ engine build artifacts (machine-specific CMake caches must never be
+# copied across OS/arch — rebuild locally via scripts/kaggle_clean_az.sh)
+cpp/build/
+az_cpp_mcts*.pyd
+az_cpp_mcts*.so
+az_cpp_mcts*.dylib
+kaggle_cpp_benchmark.json

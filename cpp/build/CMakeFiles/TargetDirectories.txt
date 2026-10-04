@@ -1,3 +1,0 @@
-D:/ChessAI-cloud/cpp/build/CMakeFiles/az_cpp_mcts.dir
-D:/ChessAI-cloud/cpp/build/CMakeFiles/edit_cache.dir
-D:/ChessAI-cloud/cpp/build/CMakeFiles/rebuild_cache.dir
