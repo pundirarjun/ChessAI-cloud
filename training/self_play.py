@@ -94,6 +94,9 @@ def _play_games_gpu(
     dirichlet_alpha=0.3,
     dirichlet_epsilon=0.25,
     batch_size=128,
+    engine="python_gpu_reference",
+    c_puct=1.5,
+    seed=0,
 ):
     """GPU-resident self-play.
 
@@ -110,7 +113,16 @@ def _play_games_gpu(
     _ = batch_size
 
     states = GPUChess(device, num_games)
-    search = GPUMCTS(model=model, device=device)
+    if engine == "cpp":
+        from mcts.cpp_mcts import CppMctsAdapter
+
+        search = CppMctsAdapter(
+            model=model, device=device, c_puct=c_puct, seed=seed
+        )
+    elif engine == "python_gpu_reference":
+        search = GPUMCTS(model=model, device=device, c_puct=c_puct)
+    else:
+        raise ValueError(f"Unknown MCTS engine: {engine!r}")
 
     # All per-move training information remains on the GPU.  0/1 board planes
     # are stored as uint8 because they are exact and much smaller than float32.
@@ -416,6 +428,8 @@ def _multi_gpu_self_play_worker(
     batch_size: int,
     seed: int,
     model_kwargs: Optional[dict] = None,
+    engine: str = "python_gpu_reference",
+    c_puct: float = 1.5,
 ):
     """Run one independent self-play shard on one CUDA device.
 
@@ -465,6 +479,9 @@ def _multi_gpu_self_play_worker(
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_epsilon=dirichlet_epsilon,
         batch_size=batch_size,
+        engine=engine,
+        c_puct=c_puct,
+        seed=seed,
     )
 
     torch.save(results, output_path)
@@ -488,6 +505,8 @@ def play_games_multi_gpu(
     batch_size=128,
     seed=42,
     model_kwargs: Optional[dict] = None,
+    engine: str = "python_gpu_reference",
+    c_puct: float = 1.5,
 ):
     """Split self-play across all visible CUDA GPUs.
 
@@ -511,6 +530,9 @@ def play_games_multi_gpu(
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
             batch_size=batch_size,
+            engine=engine,
+            c_puct=c_puct,
+            seed=seed,
         )
 
     gpu_count = torch.cuda.device_count()
@@ -526,6 +548,9 @@ def play_games_multi_gpu(
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
             batch_size=batch_size,
+            engine=engine,
+            c_puct=c_puct,
+            seed=seed,
         )
 
     # Use every visible GPU. For your current 2-GPU setup this becomes
@@ -575,6 +600,8 @@ def play_games_multi_gpu(
                     batch_size,
                     seed + rank,
                     model_kwargs,
+                    engine,
+                    c_puct,
                 ),
             )
             process.start()
@@ -623,6 +650,9 @@ def play_games(
     dirichlet_alpha=0.3,
     dirichlet_epsilon=0.25,
     batch_size=128,
+    engine="python_gpu_reference",
+    c_puct=1.5,
+    seed=0,
 ):
     """Run GPU-native self-play when the model is CUDA; otherwise use legacy path."""
     if next(model.parameters()).device.type == "cuda":
@@ -637,6 +667,14 @@ def play_games(
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
             batch_size=batch_size,
+            engine=engine,
+            c_puct=c_puct,
+            seed=seed,
+        )
+    if engine != "python_gpu_reference":
+        raise NotImplementedError(
+            f"MCTS engine {engine!r} requires a CUDA model; "
+            "the CPU fallback only supports python_gpu_reference."
         )
 
     # CPU fallback imports are lazy so CUDA runs never import python-chess.

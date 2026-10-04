@@ -74,6 +74,8 @@ def generate_self_play(
             batch_size=config.mcts.batch_size,
             seed=config.runtime.seed + iteration * 100_000,
             model_kwargs=architecture_kwargs(config.architecture),
+            engine=config.mcts.engine,
+            c_puct=config.mcts.c_puct,
         )
     else:
         results = play_games(
@@ -87,6 +89,9 @@ def generate_self_play(
             dirichlet_alpha=settings.dirichlet_alpha,
             dirichlet_epsilon=settings.dirichlet_epsilon,
             batch_size=config.mcts.batch_size,
+            engine=config.mcts.engine,
+            c_puct=config.mcts.c_puct,
+            seed=config.runtime.seed + iteration * 100_000,
         )
     return _record_results(results, replay=replay, iteration=iteration)
 

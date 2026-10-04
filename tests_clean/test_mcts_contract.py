@@ -36,7 +36,12 @@ def test_puct_uses_parent_perspective_and_virtual_visits():
     second.visit_count, second.value_sum, second.prior = 4, 2.0, 0.7
     # First child is good for its parent because child value is negative.
     assert root.select_child(c_puct=0.1)[1] is first
-    first.virtual_visit_count = 100
+    # Virtual loss adds temporary visits AND a temporary value sum; the PUCT
+    # score must use both, matching Node.apply_virtual_loss semantics.
+    for _ in range(100):
+        first.apply_virtual_loss(1.0)
+    assert first.virtual_visit_count == 100
+    assert first.virtual_value_sum == 100.0
     assert root.select_child(c_puct=0.1)[1] is second
 
 

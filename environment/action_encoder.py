@@ -36,7 +36,11 @@ class ActionEncoder:
 
                 self._add_action(move)
 
-        # Promotion moves
+        # Promotion moves: white first (ids 4032..4287), then black
+        # (4288..4543).  Two separate loops are required because a single
+        # square loop would reach rank 2 (black) before rank 7 (white).
+        # This must match environment.gpu_chess._action_tables exactly; a
+        # cross-consistency test enforces it.
         for from_square in chess.SQUARES:
 
             rank = chess.square_rank(from_square)
@@ -59,8 +63,12 @@ class ActionEncoder:
 
                         self._add_action(move)
 
+        for from_square in chess.SQUARES:
+
+            rank = chess.square_rank(from_square)
+
             # Black promotion starts from rank 2
-            elif rank == 1:
+            if rank == 1:
 
                 for to_square in chess.SQUARES:
 

@@ -496,7 +496,11 @@ class GPUChess:
             transit_attacked = self._attacked(idx, torch.full((b,), transit, device=self.device, dtype=torch.long), torch.where(self.turn, torch.zeros(b, dtype=torch.long, device=self.device), torch.ones(b, dtype=torch.long, device=self.device)))
             final_attacked = self._attacked(idx, torch.full((b,), final, device=self.device, dtype=torch.long), torch.where(self.turn, torch.zeros(b, dtype=torch.long, device=self.device), torch.ones(b, dtype=torch.long, device=self.device)))
             candidate &= (~current_check & ~transit_attacked & ~final_attacked)[:, None]
-            mask &= ~((ck == kind) & castle)
+            # A castling-geometry action may also be a genuine rook/queen slide
+            # from the castling square (e.g. Re1-g1 with the king elsewhere).
+            # The two cases are mutually exclusive per state: castling requires
+            # the king on the home square while a slide requires a rook or
+            # queen there.  Never clear generic slides for failed candidates.
             mask |= candidate
 
         return mask
@@ -615,7 +619,10 @@ class GPUChess:
         )
         rfb = self.square_bits[rook_from]
         rtb = self.square_bits[rook_to]
-        castle = ck > 0
+        # Only a king move on a castling-geometry action is a real castle.
+        # A rook/queen sharing that action id (e.g. Re1-g1) must not trigger
+        # the rook relocation.
+        castle = (ck > 0) & (moving == KING)
         new.pieces[:, ROOK] = torch.where(
             castle & (~turn),
             (new.pieces[:, ROOK] & ~rfb) | rtb,
@@ -718,31 +725,66 @@ class GPUChess:
         return terminal, value
 
     def insufficient_material(self) -> torch.Tensor:
-        p = self.pieces
-        pawns = p[:, PAWN] | p[:, 6 + PAWN]
-        rooks = p[:, ROOK] | p[:, 6 + ROOK]
-        queens = p[:, QUEEN] | p[:, 6 + QUEEN]
-        if False:
-            pass
-        minor_count = torch.zeros((p.shape[0],), dtype=torch.int32, device=self.device)
-        for idx in (KNIGHT, BISHOP, 6 + KNIGHT, 6 + BISHOP):
-            minor_count += (p[:, idx] != 0).to(torch.int32)
-        basic = (pawns == 0) & (rooks == 0) & (queens == 0) & (minor_count <= 1)
+        """FIDE dead-position test matching python-chess is_insufficient_material.
 
-        # K+B vs K+B is dead only when both bishops are on the same color.
-        both_bishops = (p[:, BISHOP] != 0) & (p[:, 6 + BISHOP] != 0)
-        only_bishops = (pawns == 0) & (rooks == 0) & (queens == 0) & (p[:, KNIGHT] == 0) & (p[:, 6 + KNIGHT] == 0)
-        wb = p[:, BISHOP]
-        bb = p[:, 6 + BISHOP]
-        # Bishop square color: a1 is dark; parity of rank+file identifies color.
-        bishop_color = torch.zeros((p.shape[0], 64), dtype=torch.bool, device=self.device)
-        bishop_color[:, 1::2] = True
-        # Reduce the one-hot bishop bitboard to a square-color flag.
-        white_bishop_light = ((wb[:, None] & self.square_bits[None, :]) != 0) & bishop_color
-        black_bishop_light = ((bb[:, None] & self.square_bits[None, :]) != 0) & bishop_color
-        same_color = white_bishop_light.any(dim=1) == black_bishop_light.any(dim=1)
-        bishop_dead = both_bishops & only_bishops & same_color
-        return basic | bishop_dead
+        Matches ``all(has_insufficient_material(c) for c in COLORS)``: a color
+        without pawn/rook/queen is insufficient when it has no piece (bare
+        king), a lone knight whose side has at most 2 pieces while the opponent
+        has no knight or bishop, or only bishops when every bishop (both sides)
+        sits on one square color and neither side has a knight.
+        """
+        p = self.pieces
+        white_occ = p[:, 0].clone()
+        for i in range(1, 6):
+            white_occ |= p[:, i]
+        black_occ = p[:, 6].clone()
+        for i in range(7, 12):
+            black_occ |= p[:, i]
+
+        # Safe popcount of the 64-bit two's-complement pattern: bit k of
+        # (x >> k) equals bit k of x regardless of arithmetic/logical shift.
+        shifts = torch.arange(64, device=self.device, dtype=torch.int64)
+        white_cnt = ((white_occ.unsqueeze(1) >> shifts) & 1).sum(dim=1)
+        black_cnt = ((black_occ.unsqueeze(1) >> shifts) & 1).sum(dim=1)
+
+        white_prq = (p[:, PAWN] | p[:, ROOK] | p[:, QUEEN]) != 0
+        black_prq = (p[:, 6 + PAWN] | p[:, 6 + ROOK] | p[:, 6 + QUEEN]) != 0
+
+        white_n = p[:, KNIGHT] != 0
+        white_b = p[:, BISHOP] != 0
+        black_n = p[:, 6 + KNIGHT] != 0
+        black_b = p[:, 6 + BISHOP] != 0
+
+        # All bishops on one square color: light = (rank + file) parity == 1.
+        # Byte pattern by rank: rank0 AA, rank1 55, ... -> 0x55AA55AA55AA55AA.
+        light = _signed_u64(0x55AA55AA55AA55AA)
+        dark = _signed_u64(0xAA55AA55AA55AA55)
+        bishops = p[:, BISHOP] | p[:, 6 + BISHOP]
+        has_light = (bishops & light) != 0
+        has_dark = (bishops & dark) != 0
+        one_color = ~(has_light & has_dark)
+        knights_any = white_n | black_n
+
+        # python-chess order: knight branch wins if the color has any knight.
+        white_ins = ~white_prq & torch.where(
+            white_n,
+            (white_cnt <= 2) & ~black_n & ~black_b,
+            torch.where(
+                white_b,
+                one_color & ~knights_any,
+                torch.ones_like(white_n),
+            ),
+        )
+        black_ins = ~black_prq & torch.where(
+            black_n,
+            (black_cnt <= 2) & ~white_n & ~white_b,
+            torch.where(
+                black_b,
+                one_color & ~knights_any,
+                torch.ones_like(black_n),
+            ),
+        )
+        return white_ins & black_ins
 
     def _legal_en_passant_available(self) -> torch.Tensor:
         """Whether an en-passant capture is legal in each current position.
