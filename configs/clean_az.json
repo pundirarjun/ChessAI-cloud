@@ -9,7 +9,7 @@
   },
   "evaluation": {
     "confidence_level": 0.95,
-    "games": 48,
+    "games": 60,
     "include_truncations": false,
     "max_moves": 400,
     "min_completed_games": 32,

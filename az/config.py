@@ -57,7 +57,7 @@ class TrainingConfig:
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    games: int = 48
+    games: int = 60
     simulations: int = 400
     temperature: float = 1.0
     temperature_moves: int = 400
