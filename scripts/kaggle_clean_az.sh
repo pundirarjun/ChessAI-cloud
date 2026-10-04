@@ -32,8 +32,16 @@ python -m pytest -q tests_clean tests
 
 # ---------------------------------------------------------------
 # 3. Preflight: artifacts, GPU count, and the compiled engine.
+#    `init` creates exactly one run namespace and refuses to reuse
+#    it; on re-runs we keep the existing manifest (provenance) and
+#    let preflight verify the config hash still matches.
 # ---------------------------------------------------------------
-python clean_az.py init --config "$CONFIG"
+RUN_MANIFEST="$(python -c "import sys; from az.config import RunConfig; from az.provenance import MANIFEST_NAME; print(RunConfig.load_json(sys.argv[1]).root / MANIFEST_NAME)" "$CONFIG")"
+if [ -f "$RUN_MANIFEST" ]; then
+  echo "Reusing existing clean run manifest: $RUN_MANIFEST"
+else
+  python clean_az.py init --config "$CONFIG"
+fi
 python clean_az.py preflight --config "$CONFIG" --require-two-gpus --require-cpp-engine
 
 # ---------------------------------------------------------------
