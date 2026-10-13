@@ -97,21 +97,42 @@ PY
 size_mb="$(du -sm "$RUN_DIR/checkpoints" | awk '{print $1}')"
 echo "[upload] packaging $size_mb MB of checkpoints (iteration $ITER)"
 
-# Probe with -p into the upload dir: kaggle CLI 2.x `datasets version`
-# requires dataset-metadata.json in the version folder and applies its
-# fields, and the probe downloads the dataset's own metadata file there, so
-# keeping it preserves the existing title/description.  Old versions are
-# kept unless KAGGLE_CHECKPOINT_PRUNE_OLD=1, so files already in the
-# dataset are never destroyed while the merge/replace semantics of
-# `datasets version` are still unverified.
-minimal_metadata() {
-  printf '{"title":"ChessAI clean AZ checkpoints","id":"%s","licenses":[{"name":"CC BY-SA 4.0"}]}\n' \
-    "$SLUG" > "$upload_dir/dataset-metadata.json"
+# dataset-metadata.json is required by `datasets version`/`create` and must
+# identify the dataset with an `id` or `id_no` (otherwise the CLI fails with
+# "ID or slug must be specified in the metadata").  Probe with -p into the
+# upload dir so the downloaded file (existing title/description) is kept, and
+# fill in only a missing identity; a missing/unreadable file becomes minimal
+# metadata.  Old versions are kept unless KAGGLE_CHECKPOINT_PRUNE_OLD=1, so
+# files already in the dataset are never destroyed while the merge/replace
+# semantics of `datasets version` are still unverified.
+ensure_metadata_identity() {
+  python - "$upload_dir/dataset-metadata.json" "$SLUG" <<'PY'
+import json
+import sys
+
+path, slug = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("metadata is not a JSON object")
+except Exception:
+    data = None
+if data is None:
+    data = {
+        "title": "ChessAI clean AZ checkpoints",
+        "id": slug,
+        "licenses": [{"name": "CC BY-SA 4.0"}],
+    }
+elif not data.get("id") and not data.get("id_no"):
+    data["id"] = slug
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2)
+    handle.write("\n")
+PY
 }
 if kaggle datasets metadata "$SLUG" -p "$upload_dir" >/dev/null 2>&1; then
-  if [ ! -f "$upload_dir/dataset-metadata.json" ]; then
-    minimal_metadata
-  fi
+  ensure_metadata_identity
   if [ "${KAGGLE_CHECKPOINT_PRUNE_OLD:-0}" = "1" ]; then
     kaggle datasets version -p "$upload_dir" -m "iteration $ITER checkpoints" -d
   else
@@ -120,7 +141,7 @@ if kaggle datasets metadata "$SLUG" -p "$upload_dir" >/dev/null 2>&1; then
 else
   # Creating: metadata is required, and there is no prior content to lose.
   # NOTE: `datasets create` has no -m flag; the message lives in metadata only.
-  minimal_metadata
+  ensure_metadata_identity
   kaggle datasets create -p "$upload_dir"
 fi
 echo "[upload] saved checkpoints (iteration $ITER) to https://www.kaggle.com/datasets/$SLUG"

@@ -139,25 +139,46 @@ def _write_metadata(upload_dir: Path, slug: str) -> None:
     )
 
 
+def _ensure_metadata_identity(path: Path, slug: str) -> None:
+    """Guarantee dataset-metadata.json exists and identifies the dataset.
+
+    kaggle CLI 2.x `datasets version`/`create` fail with "ID or slug must be
+    specified in the metadata" unless an `id` or `id_no` key is present, and
+    the file downloaded by `datasets metadata` does not always carry one.
+    Existing fields (title, description, ...) are preserved; only a missing
+    identity is filled in, and an absent/unreadable file becomes the
+    minimal metadata.
+    """
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("metadata is not a JSON object")
+    except (OSError, ValueError):
+        _write_metadata(path.parent, slug)
+        return
+    if not data.get("id") and not data.get("id_no"):
+        data["id"] = slug
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
 def _upload(upload_dir: Path, slug: str, message: str, prune_old: bool, cli: str) -> None:
     probe = subprocess.run(
         [cli, "datasets", "metadata", slug, "-p", str(upload_dir)],
         capture_output=True,
         text=True,
     )
+    # Keep whatever the probe downloaded (it holds the dataset's real
+    # title/description), but make sure it identifies the dataset; a missing
+    # or unreadable file becomes the minimal metadata.  Old versions are
+    # kept unless prune_old, so files already in the dataset are never
+    # destroyed while the merge/replace semantics are still unverified.
+    _ensure_metadata_identity(upload_dir / "dataset-metadata.json", slug)
     if probe.returncode == 0:
-        # kaggle CLI 2.x `datasets version` requires dataset-metadata.json in
-        # the version folder and applies its fields.  The probe (run inside
-        # the folder) just downloaded the dataset's own metadata file, so
-        # keeping it preserves the existing title/description; only fall back
-        # to a minimal file if the CLI did not produce one.
-        if not (upload_dir / "dataset-metadata.json").is_file():
-            _write_metadata(upload_dir, slug)
         command = [cli, "datasets", "version", "-p", str(upload_dir), "-m", message]
         if prune_old:
             command.append("-d")
     else:
-        _write_metadata(upload_dir, slug)
         command = [cli, "datasets", "create", "-p", str(upload_dir)]
     subprocess.run(command, check=True)
 

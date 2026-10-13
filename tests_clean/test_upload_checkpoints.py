@@ -79,8 +79,12 @@ def test_resolve_credentials_fails_without_any_source(
         upload_checkpoints.resolve_credentials()
 
 
-def _recorder(probe_rc: int = 0, probe_writes: bool = True):
-    """Fake subprocess.run for _upload; returns (fake_run, seen_commands)."""
+def _recorder(probe_rc: int = 0, probe_writes: bool = True, probe_content=None):
+    """Fake subprocess.run for _upload; returns (fake_run, seen_commands).
+
+    probe_content mimics what `kaggle datasets metadata` (2.0.2) actually
+    writes: title and friends but no `id`/`id_no`.
+    """
 
     seen: list[list[str]] = []
 
@@ -90,8 +94,9 @@ def _recorder(probe_rc: int = 0, probe_writes: bool = True):
         if argv[1:3] == ["datasets", "metadata"]:
             if probe_rc == 0 and probe_writes:
                 dest = Path(argv[argv.index("-p") + 1])
+                content = {"title": "original title"} if probe_content is None else probe_content
                 dest.joinpath("dataset-metadata.json").write_text(
-                    json.dumps({"id": argv[2], "title": "original title"}),
+                    json.dumps(content),
                     encoding="utf-8",
                 )
             return types.SimpleNamespace(returncode=probe_rc, stdout="", stderr="")
@@ -100,7 +105,7 @@ def _recorder(probe_rc: int = 0, probe_writes: bool = True):
     return fake_run, seen
 
 
-def test_upload_keeps_probed_metadata(
+def test_upload_keeps_probed_metadata_and_injects_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_run, seen = _recorder()
@@ -108,10 +113,31 @@ def test_upload_keeps_probed_metadata(
     upload_checkpoints._upload(tmp_path, "owner/ds", "iteration 5 checkpoints", False, "kaggle")
     data = json.loads((tmp_path / "dataset-metadata.json").read_text(encoding="utf-8"))
     assert data["title"] == "original title"
+    assert data["id"] == "owner/ds"
     assert seen[0][1:3] == ["datasets", "metadata"]
     assert seen[1][1:3] == ["datasets", "version"]
     assert seen[1][seen[1].index("-p") + 1] == str(tmp_path)
     assert "-d" not in seen[1]
+
+
+def test_upload_leaves_existing_id_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_run, _ = _recorder(probe_content={"id": "owner/real-ds", "title": "original title"})
+    monkeypatch.setattr(upload_checkpoints.subprocess, "run", fake_run)
+    upload_checkpoints._upload(tmp_path, "owner/ds", "iteration 5 checkpoints", False, "kaggle")
+    data = json.loads((tmp_path / "dataset-metadata.json").read_text(encoding="utf-8"))
+    assert data["id"] == "owner/real-ds"
+    assert data["title"] == "original title"
+
+
+def test_ensure_metadata_identity_replaces_invalid_json(tmp_path: Path) -> None:
+    path = tmp_path / "dataset-metadata.json"
+    path.write_text("not json", encoding="utf-8")
+    upload_checkpoints._ensure_metadata_identity(path, "owner/ds")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["id"] == "owner/ds"
+    assert data["title"] == "ChessAI clean AZ checkpoints"
 
 
 def test_upload_falls_back_when_probe_writes_nothing(
