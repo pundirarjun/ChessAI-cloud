@@ -15,8 +15,8 @@ set -euo pipefail
 # Usage: kaggle_persist.sh restore|save [project_root]
 #
 # Enabled automatically inside Kaggle notebooks (detected via /kaggle/input
-# or KAGGLE_KERNEL_RUN_TYPE); credentials come from KAGGLE_USERNAME/KAGGLE_KEY
-# or, if unset, from ~/.kaggle/kaggle.json.
+# or KAGGLE_KERNEL_RUN_TYPE); credentials come from KAGGLE_USERNAME/KAGGLE_KEY,
+# ~/.kaggle/kaggle.json, or Kaggle notebook secrets (scripts/kaggle_creds.sh).
 #   KAGGLE_DATASET_SLUG  override the default "$KAGGLE_USERNAME/chessai-clean-az-run"
 #   PERSIST=0            disable entirely
 
@@ -26,7 +26,6 @@ case "$ACTION" in
   restore|save) ;;
   *) echo "usage: $0 restore|save [project_root]" >&2; exit 2 ;;
 esac
-cd "$PROJECT_ROOT"
 
 if [ "${PERSIST:-1}" = "0" ]; then
   echo "[persist] disabled via PERSIST=0"
@@ -36,18 +35,13 @@ if ! { [ -d /kaggle/input ] || [ -n "${KAGGLE_KERNEL_RUN_TYPE:-}" ]; }; then
   echo "[persist] not a Kaggle notebook; skipping $ACTION"
   exit 0
 fi
-# Credentials: prefer env vars; fall back to ~/.kaggle/kaggle.json, which
-# Kaggle notebooks mount even when KAGGLE_USERNAME/KAGGLE_KEY are unset.
-if [ -z "${KAGGLE_USERNAME:-}" ] || [ -z "${KAGGLE_KEY:-}" ]; then
-  if [ -f "$HOME/.kaggle/kaggle.json" ]; then
-    KAGGLE_USERNAME="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["username"])' "$HOME/.kaggle/kaggle.json")"
-    KAGGLE_KEY="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["key"])' "$HOME/.kaggle/kaggle.json")"
-    export KAGGLE_USERNAME KAGGLE_KEY
-    echo "[persist] credentials loaded from $HOME/.kaggle/kaggle.json"
-  else
-    echo "[persist] no credentials (env vars or $HOME/.kaggle/kaggle.json); skipping $ACTION"
-    exit 0
-  fi
+
+cd "$PROJECT_ROOT"
+# Credentials: env vars, ~/.kaggle/kaggle.json, or Kaggle notebook secrets.
+source scripts/kaggle_creds.sh
+if ! kaggle_resolve_credentials; then
+  echo "[persist] no credentials (env, kaggle.json, or Kaggle secrets); skipping $ACTION"
+  exit 0
 fi
 
 SLUG="${KAGGLE_DATASET_SLUG:-$KAGGLE_USERNAME/chessai-clean-az-run}"
