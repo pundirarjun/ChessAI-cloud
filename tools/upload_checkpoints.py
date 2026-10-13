@@ -125,33 +125,39 @@ def _resolve_kaggle_cli() -> str:
     return resolved or "kaggle"
 
 
+def _write_metadata(upload_dir: Path, slug: str) -> None:
+    (upload_dir / "dataset-metadata.json").write_text(
+        json.dumps(
+            {
+                "title": "ChessAI clean AZ checkpoints",
+                "id": slug,
+                "licenses": [{"name": "CC BY-SA 4.0"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _upload(upload_dir: Path, slug: str, message: str, prune_old: bool, cli: str) -> None:
     probe = subprocess.run(
-        [cli, "datasets", "metadata", slug],
-        cwd=upload_dir,
+        [cli, "datasets", "metadata", slug, "-p", str(upload_dir)],
         capture_output=True,
         text=True,
     )
-    # The probe drops the dataset's real metadata json into the upload dir;
-    # remove it so the version upload carries only our archive (the create
-    # path writes its own metadata file below).
-    (upload_dir / "dataset-metadata.json").unlink(missing_ok=True)
     if probe.returncode == 0:
+        # kaggle CLI 2.x `datasets version` requires dataset-metadata.json in
+        # the version folder and applies its fields.  The probe (run inside
+        # the folder) just downloaded the dataset's own metadata file, so
+        # keeping it preserves the existing title/description; only fall back
+        # to a minimal file if the CLI did not produce one.
+        if not (upload_dir / "dataset-metadata.json").is_file():
+            _write_metadata(upload_dir, slug)
         command = [cli, "datasets", "version", "-p", str(upload_dir), "-m", message]
         if prune_old:
             command.append("-d")
     else:
-        (upload_dir / "dataset-metadata.json").write_text(
-            json.dumps(
-                {
-                    "title": "ChessAI clean AZ checkpoints",
-                    "id": slug,
-                    "licenses": [{"name": "CC BY-SA 4.0"}],
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        _write_metadata(upload_dir, slug)
         command = [cli, "datasets", "create", "-p", str(upload_dir)]
     subprocess.run(command, check=True)
 

@@ -97,12 +97,21 @@ PY
 size_mb="$(du -sm "$RUN_DIR/checkpoints" | awk '{print $1}')"
 echo "[upload] packaging $size_mb MB of checkpoints (iteration $ITER)"
 
-if kaggle datasets metadata "$SLUG" >/dev/null 2>&1; then
-  # dataset-metadata.json is deliberately NOT included: the version command
-  # would overwrite the existing dataset's title/description with ours.
-  # Old versions are kept unless KAGGLE_CHECKPOINT_PRUNE_OLD=1, so files
-  # already in the dataset are never destroyed while the merge/replace
-  # semantics of `datasets version` are still unverified.
+# Probe with -p into the upload dir: kaggle CLI 2.x `datasets version`
+# requires dataset-metadata.json in the version folder and applies its
+# fields, and the probe downloads the dataset's own metadata file there, so
+# keeping it preserves the existing title/description.  Old versions are
+# kept unless KAGGLE_CHECKPOINT_PRUNE_OLD=1, so files already in the
+# dataset are never destroyed while the merge/replace semantics of
+# `datasets version` are still unverified.
+minimal_metadata() {
+  printf '{"title":"ChessAI clean AZ checkpoints","id":"%s","licenses":[{"name":"CC BY-SA 4.0"}]}\n' \
+    "$SLUG" > "$upload_dir/dataset-metadata.json"
+}
+if kaggle datasets metadata "$SLUG" -p "$upload_dir" >/dev/null 2>&1; then
+  if [ ! -f "$upload_dir/dataset-metadata.json" ]; then
+    minimal_metadata
+  fi
   if [ "${KAGGLE_CHECKPOINT_PRUNE_OLD:-0}" = "1" ]; then
     kaggle datasets version -p "$upload_dir" -m "iteration $ITER checkpoints" -d
   else
@@ -111,8 +120,7 @@ if kaggle datasets metadata "$SLUG" >/dev/null 2>&1; then
 else
   # Creating: metadata is required, and there is no prior content to lose.
   # NOTE: `datasets create` has no -m flag; the message lives in metadata only.
-  printf '{"title":"ChessAI clean AZ checkpoints","id":"%s","licenses":[{"name":"CC BY-SA 4.0"}]}\n' \
-    "$SLUG" > "$upload_dir/dataset-metadata.json"
+  minimal_metadata
   kaggle datasets create -p "$upload_dir"
 fi
 echo "[upload] saved checkpoints (iteration $ITER) to https://www.kaggle.com/datasets/$SLUG"
