@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import importlib.util
+import os
 
 import torch
 
@@ -59,6 +60,10 @@ def run_preflight(
         )
     else:
         checks["cpp_engine"] = "not required for this reference-only preflight"
+    try:
+        checks["system_ram"] = _check_system_ram(config)
+    except Exception as error:
+        checks["system_ram"] = f"info: ram check unavailable ({error})"
     # CPU correctness remains a first-class gate. This verifies imports and
     # action-space identity; full pytest is invoked by the documented command.
     try:
@@ -77,3 +82,29 @@ def run_preflight(
         checks["baseline_contract"] = f"fail: {error}"
     passed = all(value == "pass" or value.startswith("info:") or value.startswith("not required") for value in checks.values())
     return PreflightReport(passed=passed, checks=checks)
+
+
+# Sparse schema-v2 sample: uint8 state (1152 B) + sparse policy (~28 entries)
+# + value + provenance + Python object overhead, rounded up conservatively.
+_BYTES_PER_SAMPLE = 3 * 1024
+# Parent replay save payload, two DDP rank copies, models/CUDA/OS overhead.
+_FIXED_OVERHEAD_BYTES = 6 * 1024**3
+
+
+def _check_system_ram(config: RunConfig) -> str:
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        total_pages = os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, OSError, ValueError):
+        return "info: system RAM total unavailable on this platform"
+    total_bytes = int(page_size) * int(total_pages)
+    if total_bytes <= 0:
+        return "info: system RAM total unavailable on this platform"
+    needed = config.storage.replay_capacity * _BYTES_PER_SAMPLE * 3 + _FIXED_OVERHEAD_BYTES
+    if needed > total_bytes:
+        return (
+            f"fail: replay capacity {config.storage.replay_capacity} needs ~"
+            f"{needed // 1024**3} GiB peak but only {total_bytes // 1024**3} GiB "
+            f"RAM is installed; lower storage.replay_capacity"
+        )
+    return "pass"

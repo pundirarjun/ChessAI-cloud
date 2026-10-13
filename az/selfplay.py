@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import torch
 
@@ -97,14 +97,16 @@ def generate_self_play(
 
 
 def _record_results(
-    results: list[SelfPlayResult],
+    results: Iterable[SelfPlayResult],
     *,
     replay: CleanReplayBuffer,
     iteration: int,
 ) -> SelfPlaySummary:
     completed = incomplete = white_wins = black_wins = draws = samples_added = 0
+    total_games = 0
     reasons: dict[str, int] = {}
     for game_id, result in enumerate(results):
+        total_games += 1
         reasons[result.termination] = reasons.get(result.termination, 0) + 1
         if not result.completed:
             incomplete += 1
@@ -128,7 +130,7 @@ def _record_results(
         else:
             raise RuntimeError("Completed self-play game has no terminal result.")
     return SelfPlaySummary(
-        games=len(results),
+        games=total_games,
         completed_games=completed,
         incomplete_games=incomplete,
         white_wins=white_wins,

@@ -22,6 +22,29 @@ from az.provenance import (
 CHECKPOINT_ROLES = {"best", "candidate", "iteration"}
 
 
+def prune_iteration_checkpoints(root: str | Path, keep: int) -> list[Path]:
+    """Delete all but the newest `keep` iteration checkpoints. Returns removed paths."""
+
+    if keep < 1:
+        raise ValueError("keep must be >= 1.")
+    directory = Path(root) / "checkpoints"
+    if not directory.is_dir():
+        return []
+    numbered = []
+    for path in directory.glob("iteration_*.pt"):
+        try:
+            number = int(path.stem.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        numbered.append((number, path))
+    numbered.sort(key=lambda item: item[0], reverse=True)
+    removed: list[Path] = []
+    for _, path in numbered[keep:]:
+        path.unlink(missing_ok=True)
+        removed.append(path)
+    return removed
+
+
 def checkpoint_relative_path(role: str, iteration: int | None = None) -> str:
     if role not in CHECKPOINT_ROLES:
         raise ValueError(f"Unknown checkpoint role: {role}")

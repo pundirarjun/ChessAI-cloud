@@ -18,7 +18,7 @@ def main() -> None:
         checkpoint = Path(directory) / "fresh_best.pt"
         model = ChessNet().to("cuda:0").eval()
         torch.save({"model_state_dict": model.state_dict()}, checkpoint)
-        results = play_games_multi_gpu(
+        results = list(play_games_multi_gpu(
             model=model,
             checkpoint_path=checkpoint,
             num_games=2,
@@ -26,7 +26,7 @@ def main() -> None:
             max_moves=2,
             batch_size=2,
             model_kwargs={"action_space_size": 4544},
-        )
+        ))
     if len(results) != 2:
         raise RuntimeError(f"Expected 2 results, received {len(results)}.")
     print("PASS: one self-play worker completed on each visible GPU.")

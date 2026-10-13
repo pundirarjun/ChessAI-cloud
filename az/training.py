@@ -51,9 +51,11 @@ class _ReplayDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         sample: ReplaySample = self.samples[index]
+        state = sample.dense_state()
+        policy = sample.dense_policy()
         return (
-            torch.from_numpy(sample.state),
-            torch.from_numpy(sample.policy),
+            torch.from_numpy(state),
+            torch.from_numpy(policy),
             torch.tensor(sample.value, dtype=torch.float32),
         )
 

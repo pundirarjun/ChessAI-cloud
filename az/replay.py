@@ -1,4 +1,11 @@
-"""CPU-resident replay with mandatory clean-run/game/position provenance."""
+"""CPU-resident replay with mandatory clean-run/game/position provenance.
+
+Storage format (schema v2): states are uint8 (exact 0/1 planes) and policies
+are stored sparsely as (indices, values) for the ~28 legal-move entries instead
+of a dense 4544-vector.  This reduces per-sample memory from ~22.8 KB to
+~1.3 KB, which is what makes a 150k-sample buffer fit comfortably alongside
+DDP training copies on Kaggle's ~29 GB system RAM.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +30,7 @@ from az.provenance import (
 
 STATE_SHAPE = (18, 8, 8)
 POLICY_SHAPE = (4544,)
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -35,10 +43,31 @@ class SampleProvenance:
 
 @dataclass(frozen=True)
 class ReplaySample:
-    state: np.ndarray
-    policy: np.ndarray
+    """Compact replay sample: uint8 state + sparse policy."""
+
+    state: np.ndarray  # uint8 (18, 8, 8)
+    policy_indices: np.ndarray  # int16 (N,) action indices with non-zero policy
+    policy_values: np.ndarray  # float32 (N,) policy probabilities at those indices
     value: float
     provenance: SampleProvenance
+
+    def dense_state(self) -> np.ndarray:
+        return self.state.astype(np.float32)
+
+    def dense_policy(self) -> np.ndarray:
+        policy = np.zeros(POLICY_SHAPE, dtype=np.float32)
+        policy[self.policy_indices] = self.policy_values
+        return policy
+
+
+def _compact_state(state) -> np.ndarray:
+    return np.asarray(state, dtype=np.uint8)
+
+
+def _compact_policy(policy) -> tuple[np.ndarray, np.ndarray]:
+    policy = np.asarray(policy, dtype=np.float32)
+    nonzero = np.nonzero(policy)[0]
+    return nonzero.astype(np.int16), policy[nonzero].astype(np.float32).copy()
 
 
 class CleanReplayBuffer:
@@ -65,7 +94,12 @@ class CleanReplayBuffer:
         samples: Iterable[tuple[np.ndarray, np.ndarray, float]],
         completed: bool,
     ) -> int:
-        """Add only completed games and attach immutable sample provenance."""
+        """Add only completed games and attach immutable sample provenance.
+
+        ``samples`` is an iterable of ``(state, policy, value)`` tuples where
+        ``state`` may be uint8 or float32 (0/1 planes) and ``policy`` is a
+        dense float32 vector.  Both are compacted on insertion.
+        """
 
         if not completed:
             return 0
@@ -73,9 +107,11 @@ class CleanReplayBuffer:
             raise ValueError("iteration must be >= 1 and game_id must be >= 0.")
         added = 0
         for position_index, (state, policy, value) in enumerate(samples):
+            policy_indices, policy_values = _compact_policy(policy)
             sample = ReplaySample(
-                state=np.asarray(state, dtype=np.float32).copy(),
-                policy=np.asarray(policy, dtype=np.float32).copy(),
+                state=_compact_state(state),
+                policy_indices=policy_indices,
+                policy_values=policy_values,
                 value=float(value),
                 provenance=SampleProvenance(
                     run_id=self.manifest.run_id,
@@ -95,7 +131,8 @@ class CleanReplayBuffer:
                 f"batch_size must be in [1, {len(self._samples)}], got {batch_size}."
             )
         chooser = rng if rng is not None else random
-        return chooser.sample(list(self._samples), batch_size)
+        indices = chooser.sample(range(len(self._samples)), batch_size)
+        return [self._samples[i] for i in indices]
 
     def iteration_distribution(self) -> dict[int, int]:
         return dict(sorted(Counter(s.provenance.iteration for s in self._samples).items()))
@@ -122,7 +159,7 @@ class CleanReplayBuffer:
         destination = owned_artifact_path(root, relative_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "run_id": self.manifest.run_id,
             "config_sha256": self.manifest.config_sha256,
             "kind": "clean_replay_buffer",
@@ -135,7 +172,8 @@ class CleanReplayBuffer:
             "samples": [
                 {
                     "state": sample.state,
-                    "policy": sample.policy,
+                    "policy_indices": sample.policy_indices,
+                    "policy_values": sample.policy_values,
                     "value": sample.value,
                     "provenance": asdict(sample.provenance),
                 }
@@ -161,12 +199,21 @@ class CleanReplayBuffer:
         assert_artifact_matches_run(payload["metadata"], manifest, path)
         if payload["metadata"].get("kind") != "clean_replay_buffer":
             raise RuntimeError(f"Wrong clean artifact type for replay: {path}")
+        schema_version = int(payload["metadata"].get("schema_version", 1))
         replay = cls(int(payload["metadata"]["capacity"]), manifest)
         for raw in payload.get("samples", []):
+            if schema_version == 1:
+                state = np.asarray(raw["state"], dtype=np.float32).astype(np.uint8)
+                policy_indices, policy_values = _compact_policy(raw["policy"])
+            else:
+                state = np.asarray(raw["state"], dtype=np.uint8)
+                policy_indices = np.asarray(raw["policy_indices"], dtype=np.int16)
+                policy_values = np.asarray(raw["policy_values"], dtype=np.float32)
             replay._samples.append(
                 ReplaySample(
-                    state=np.asarray(raw["state"], dtype=np.float32),
-                    policy=np.asarray(raw["policy"], dtype=np.float32),
+                    state=state,
+                    policy_indices=policy_indices,
+                    policy_values=policy_values,
                     value=float(raw["value"]),
                     provenance=SampleProvenance(**raw["provenance"]),
                 )
@@ -182,13 +229,18 @@ class CleanReplayBuffer:
             raise RuntimeError(f"{label} has foreign run provenance.")
         if sample.provenance.iteration < 1:
             raise RuntimeError(f"{label} has invalid iteration provenance.")
-        if sample.state.shape != STATE_SHAPE or sample.state.dtype != np.float32:
-            raise RuntimeError(f"{label} state must be float32{STATE_SHAPE}.")
-        if sample.policy.shape != POLICY_SHAPE or sample.policy.dtype != np.float32:
-            raise RuntimeError(f"{label} policy must be float32{POLICY_SHAPE}.")
-        if not np.isfinite(sample.state).all() or not np.isfinite(sample.policy).all():
-            raise RuntimeError(f"{label} contains non-finite state/policy values.")
-        if np.any(sample.policy < 0) or not np.isclose(sample.policy.sum(), 1.0, atol=1e-4):
+        if sample.state.shape != STATE_SHAPE or sample.state.dtype != np.uint8:
+            raise RuntimeError(f"{label} state must be uint8{STATE_SHAPE}.")
+        if sample.policy_indices.shape != sample.policy_values.shape:
+            raise RuntimeError(f"{label} policy indices/values shape mismatch.")
+        if sample.policy_indices.dtype != np.int16 or sample.policy_values.dtype != np.float32:
+            raise RuntimeError(f"{label} policy must be int16 indices + float32 values.")
+        if len(sample.policy_indices) > 0:
+            if sample.policy_indices.min() < 0 or sample.policy_indices.max() >= POLICY_SHAPE[0]:
+                raise RuntimeError(f"{label} policy indices out of range.")
+        if not np.isfinite(sample.policy_values).all():
+            raise RuntimeError(f"{label} contains non-finite policy values.")
+        if np.any(sample.policy_values < 0) or not np.isclose(sample.policy_values.sum(), 1.0, atol=1e-4):
             raise RuntimeError(f"{label} policy is not normalized.")
         if not math.isfinite(sample.value) or sample.value not in (-1.0, 0.0, 1.0):
             raise RuntimeError(f"{label} value must be one of -1, 0, 1.")

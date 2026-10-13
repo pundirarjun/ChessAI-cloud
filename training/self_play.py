@@ -46,7 +46,7 @@ class SelfPlayGame:
     def add_position(self, state: np.ndarray, policy: np.ndarray, player: int):
         self.samples.append(
             TrainingSample(
-                state=np.asarray(state, dtype=np.float32),
+                state=np.asarray(state, dtype=np.uint8),
                 policy=np.asarray(policy, dtype=np.float32),
                 player=int(player),
             )
@@ -350,7 +350,7 @@ def _play_games_gpu(
         # which is checked before the move and therefore has the same count.
         sample_count = max(0, int(move_cpu[gi]) - 1)
         if completed and sample_count > 0:
-            s = sample_states[gi, :sample_count].detach().cpu().numpy().astype(np.float32, copy=False)
+            s = sample_states[gi, :sample_count].detach().cpu().numpy()
             p = sample_policies[gi, :sample_count].detach().cpu().numpy()
             pl = sample_players[gi, :sample_count].detach().cpu().numpy()
             data = []
@@ -514,12 +514,15 @@ def play_games_multi_gpu(
     GPU, and each process runs an independent half/batch of the games. This
     targets the expensive self-play stage only; neural-network training remains
     unchanged in the parent process.
+
+    Yields SelfPlayResult objects one at a time, loading one worker shard at a
+    time so the parent never holds all game data in memory simultaneously.
     """
     if num_games <= 0:
-        return []
+        return
 
     if next(model.parameters()).device.type != "cuda":
-        return play_games(
+        yield from play_games(
             model=model,
             num_games=num_games,
             num_simulations=num_simulations,
@@ -534,10 +537,11 @@ def play_games_multi_gpu(
             c_puct=c_puct,
             seed=seed,
         )
+        return
 
     gpu_count = torch.cuda.device_count()
     if gpu_count < 2:
-        return play_games(
+        yield from play_games(
             model=model,
             num_games=num_games,
             num_simulations=num_simulations,
@@ -552,6 +556,7 @@ def play_games_multi_gpu(
             c_puct=c_puct,
             seed=seed,
         )
+        return
 
     # Use every visible GPU. For your current 2-GPU setup this becomes
     # 128 games on GPU 0 + 128 games on GPU 1 when num_games=256.
@@ -618,18 +623,20 @@ def play_games_multi_gpu(
         if failed:
             raise RuntimeError(f"Multi-GPU self-play worker failure: {failed}")
 
-        results = []
+        total = 0
         for output_path in output_paths:
             worker_results = torch.load(
                 output_path, map_location="cpu", weights_only=False
             )
-            results.extend(worker_results)
+            total += len(worker_results)
+            for result in worker_results:
+                yield result
+            del worker_results
 
         print(
-            f"MULTI-GPU SELF-PLAY COMPLETE: {len(results)} games",
+            f"MULTI-GPU SELF-PLAY COMPLETE: {total} games",
             flush=True,
         )
-        return results
     finally:
         # Restore the parent's model to its original CUDA device so the
         # existing training code can continue unchanged.

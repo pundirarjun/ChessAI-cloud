@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+import gc
 import json
 import os
 import subprocess
@@ -12,7 +13,7 @@ import uuid
 
 import torch
 
-from az.checkpoints import load_checkpoint, save_checkpoint
+from az.checkpoints import load_checkpoint, prune_iteration_checkpoints, save_checkpoint
 from az.config import RunConfig
 from az.evaluation import evaluate_candidate
 from az.model import build_fresh_model
@@ -137,11 +138,17 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
         iteration=iteration,
     )
     replay.save(root)
-    if len(replay) < config.training.batch_size:
+    replay_size = len(replay)
+    if replay_size < config.training.batch_size:
         raise RuntimeError(
-            f"Iteration {iteration} generated only {len(replay)} replay samples; "
+            f"Iteration {iteration} generated only {replay_size} replay samples; "
             f"need {config.training.batch_size} before candidate training."
         )
+    # Free the parent's replay copy before torchrun spawns DDP ranks that
+    # each torch.load the full buffer; otherwise peak RAM triples and the
+    # OOM killer fires (observed at ~133k samples on Kaggle's 29GB box).
+    del replay
+    gc.collect()
     _launch_distributed_training(config, entry_script)
     games, decision = evaluate_candidate(root=root, config=config, manifest=manifest)
 
@@ -184,12 +191,16 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
             "promotion": decision.to_dict(),
         },
     )
+    retention = config.storage.iteration_checkpoint_retention
+    if retention:
+        prune_iteration_checkpoints(root, retention)
     new_state = {
         "iteration": iteration,
         "best_iteration": best_iteration,
         "training_step": next_step,
     }
     _write_state(root, new_state)
+    replay = CleanReplayBuffer.load(root, manifest)
     return {
         "iteration": iteration,
         "self_play": self_play.to_dict(),

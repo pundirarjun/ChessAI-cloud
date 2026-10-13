@@ -138,7 +138,7 @@ def assert_artifact_matches_run(
     artifact_path: str | Path,
 ) -> None:
     reject_legacy_artifact(artifact_path)
-    if artifact_metadata.get("schema_version") != 1:
+    if artifact_metadata.get("schema_version") not in (1, 2):
         raise RuntimeError(f"Unsupported clean artifact schema: {artifact_path}")
     if artifact_metadata.get("run_id") != manifest.run_id:
         raise RuntimeError(
