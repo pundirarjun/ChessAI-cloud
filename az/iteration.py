@@ -142,7 +142,7 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
         replay=replay,
         iteration=iteration,
     )
-    print(f"[ITER {iteration}] Self-play: {self_play.completed_games}/{config.self_play.num_games} games, {self_play.new_samples} new samples", flush=True)
+    print(f"[ITER {iteration}] Self-play: {self_play.completed_games}/{config.self_play.num_games} games, {self_play.samples_added} new samples", flush=True)
     replay.save(root)
     replay_size = len(replay)
     if replay_size < config.training.batch_size:
@@ -174,7 +174,7 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
     next_step = int(candidate_payload["metadata"]["training_step"])
     print(f"[ITER {iteration}] Candidate trained: step={next_step}", flush=True)
     if decision.promote:
-        print(f"[ITER {iteration}] PROMOTED: score={decision.win_rate:.3f}, CI=[{decision.ci_low:.3f},{decision.ci_high:.3f}], games={decision.completed_games}", flush=True)
+        print(f"[ITER {iteration}] PROMOTED: score={decision.score:.3f}, wilson_lb={decision.wilson_lower_bound:.3f}, games={decision.completed_games}", flush=True)
         save_checkpoint(
             root=root,
             manifest=manifest,
@@ -187,7 +187,7 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
         )
         best_iteration = iteration
     else:
-        print(f"[ITER {iteration}] REJECTED: score={decision.win_rate:.3f}, CI=[{decision.ci_low:.3f},{decision.ci_high:.3f}], games={decision.completed_games}", flush=True)
+        print(f"[ITER {iteration}] REJECTED: score={decision.score:.3f}, wilson_lb={decision.wilson_lower_bound:.3f}, games={decision.completed_games}", flush=True)
         best_iteration = int(state["best_iteration"])
     save_checkpoint(
         root=root,
