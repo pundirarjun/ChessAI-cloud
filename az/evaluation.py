@@ -69,16 +69,15 @@ def _evaluate_local(
 ) -> list[EvaluationGame]:
     best = build_fresh_model(config.architecture, config.runtime, device)
     candidate = build_fresh_model(config.architecture, config.runtime, device)
-    load_checkpoint(root=root, manifest=manifest, role="best", model=best, map_location=device)
-    load_checkpoint(root=root, manifest=manifest, role="candidate", model=candidate, map_location=device)
+    best_payload = load_checkpoint(root=root, manifest=manifest, role="best", model=best, map_location=device)
+    cand_payload = load_checkpoint(root=root, manifest=manifest, role="candidate", model=candidate, map_location=device)
+    best_iter = best_payload["metadata"]["iteration"]
+    best_step = best_payload["metadata"]["training_step"]
+    cand_iter = cand_payload["metadata"]["iteration"]
+    cand_step = cand_payload["metadata"]["training_step"]
+    print(f"[EVAL] Candidate (iter={cand_iter}, step={cand_step}) vs Best (iter={best_iter}, step={best_step}) — {len(list(game_indices))} games @ {config.evaluation.simulations} sims", flush=True)
     best.eval()
     candidate.eval()
-    print(
-        f"[eval] playing {len(list(game_indices))} games on {device} "
-        f"@ {config.evaluation.simulations} sims "
-        f"(engine={config.mcts.engine})",
-        flush=True,
-    )
     games = []
     for game_id in game_indices:
         game = _play_one(

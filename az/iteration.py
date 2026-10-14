@@ -76,6 +76,7 @@ def train_candidate_worker(config: RunConfig) -> dict:
             optimizer=optimizer,
             map_location=context.device,
         )
+        print(f"[TRAIN-CANDIDATE rank={context.rank}] Loaded BEST for training: iter={best_payload['metadata']['iteration']}, step={best_payload['metadata']['training_step']}", flush=True)
         model, optimizer, metrics, scaler = train_candidate(
             model=candidate,
             replay=replay,
@@ -116,6 +117,7 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
     manifest = load_manifest(root)
     state = _read_state(root)
     iteration = int(state["iteration"]) + 1
+    print(f"[ITER {iteration}] Starting iteration {iteration}", flush=True)
     seed_everything(config.runtime)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     best_model = build_fresh_model(config.architecture, config.runtime, device)
@@ -128,8 +130,11 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
         optimizer=best_optimizer,
         map_location=device,
     )
+    print(f"[ITER {iteration}] Using BEST model for self-play", flush=True)
     best_path = root / "checkpoints" / "best_model.pt"
     replay = CleanReplayBuffer.load(root, manifest)
+    dist = replay.iteration_distribution()
+    print(f"[ITER {iteration}] Loaded REPLAY: {len(replay)} samples, iterations={dict(dist)}", flush=True)
     self_play = generate_self_play(
         config=config,
         model=best_model,
@@ -137,6 +142,7 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
         replay=replay,
         iteration=iteration,
     )
+    print(f"[ITER {iteration}] Self-play: {self_play.completed_games}/{config.self_play.num_games} games, {self_play.new_samples} new samples", flush=True)
     replay.save(root)
     replay_size = len(replay)
     if replay_size < config.training.batch_size:
@@ -149,6 +155,9 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
     # OOM killer fires (observed at ~133k samples on Kaggle's 29GB box).
     del replay
     gc.collect()
+    device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_ddp = device_count >= 2 and (config.runtime.num_gpus or 1) >= 2
+    print(f"[ITER {iteration}] Launching candidate training (DDP: {use_ddp and '2 GPUs' or '1 GPU'})...", flush=True)
     _launch_distributed_training(config, entry_script)
     games, decision = evaluate_candidate(root=root, config=config, manifest=manifest)
 
@@ -163,7 +172,9 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
         map_location="cpu",
     )
     next_step = int(candidate_payload["metadata"]["training_step"])
+    print(f"[ITER {iteration}] Candidate trained: step={next_step}", flush=True)
     if decision.promote:
+        print(f"[ITER {iteration}] PROMOTED: score={decision.win_rate:.3f}, CI=[{decision.ci_low:.3f},{decision.ci_high:.3f}], games={decision.completed_games}", flush=True)
         save_checkpoint(
             root=root,
             manifest=manifest,
@@ -176,6 +187,7 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
         )
         best_iteration = iteration
     else:
+        print(f"[ITER {iteration}] REJECTED: score={decision.win_rate:.3f}, CI=[{decision.ci_low:.3f},{decision.ci_high:.3f}], games={decision.completed_games}", flush=True)
         best_iteration = int(state["best_iteration"])
     save_checkpoint(
         root=root,
@@ -193,7 +205,9 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
     )
     retention = config.storage.iteration_checkpoint_retention
     if retention:
-        prune_iteration_checkpoints(root, retention)
+        removed = prune_iteration_checkpoints(root, retention)
+        if removed:
+            print(f"[ITER {iteration}] Pruned {len(removed)} old iteration checkpoints", flush=True)
     new_state = {
         "iteration": iteration,
         "best_iteration": best_iteration,
@@ -201,6 +215,7 @@ def run_iteration(config: RunConfig, *, entry_script: str | Path) -> dict:
     }
     _write_state(root, new_state)
     replay = CleanReplayBuffer.load(root, manifest)
+    print(f"[ITER {iteration}] Complete: best_iteration={best_iteration}, training_step={next_step}", flush=True)
     return {
         "iteration": iteration,
         "self_play": self_play.to_dict(),

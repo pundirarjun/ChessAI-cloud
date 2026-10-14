@@ -122,6 +122,17 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
     torch.save(payload, temporary)
     os.replace(temporary, path)
+    extra = payload.get("extra", {})
+    if role == "best":
+        promoted_at = extra.get("promotion", {}).get("promoted_at_iteration", "unknown")
+        print(f"[CHECKPOINT] Saved BEST: iter={iteration}, step={training_step}, promoted_at={promoted_at} -> {path}", flush=True)
+    elif role == "candidate":
+        parent_best = extra.get("parent_best_iteration", "unknown")
+        print(f"[CHECKPOINT] Saved CANDIDATE: iter={iteration}, step={training_step}, parent_best={parent_best} -> {path}", flush=True)
+    elif role == "iteration":
+        print(f"[CHECKPOINT] Saved ITERATION: iter={iteration}, step={training_step} -> {path}", flush=True)
+    else:
+        print(f"[CHECKPOINT] Saved {role.upper()}: iter={iteration}, step={training_step} -> {path}", flush=True)
     return path
 
 
@@ -162,4 +173,19 @@ def load_checkpoint(
         scaler.load_state_dict(payload["scaler_state_dict"])
     if restore_rng:
         restore_rng_state(payload["rng_state"])
+    metadata = payload["metadata"]
+    role = metadata.get("role")
+    iteration = metadata.get("iteration")
+    training_step = metadata.get("training_step")
+    extra = payload.get("extra", {})
+    if role == "best":
+        promoted_at = extra.get("promotion", {}).get("promoted_at_iteration", "unknown")
+        print(f"[CHECKPOINT] Loaded BEST: iter={iteration}, step={training_step}, promoted_at={promoted_at}", flush=True)
+    elif role == "candidate":
+        parent_best = extra.get("parent_best_iteration", "unknown")
+        print(f"[CHECKPOINT] Loaded CANDIDATE: iter={iteration}, step={training_step}, parent_best={parent_best}", flush=True)
+    elif role == "iteration":
+        print(f"[CHECKPOINT] Loaded ITERATION: iter={iteration}, step={training_step}", flush=True)
+    else:
+        print(f"[CHECKPOINT] Loaded {role.upper()}: iter={iteration}, step={training_step}", flush=True)
     return payload

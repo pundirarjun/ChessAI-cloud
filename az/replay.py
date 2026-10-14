@@ -183,6 +183,8 @@ class CleanReplayBuffer:
         temporary = destination.with_suffix(destination.suffix + f".{uuid.uuid4().hex}.tmp")
         torch.save(payload, temporary)
         os.replace(temporary, destination)
+        dist = self.iteration_distribution()
+        print(f"[REPLAY] Saved: {len(self)} samples -> {destination}, iterations={dict(dist)}", flush=True)
         return destination
 
     @classmethod
@@ -221,6 +223,8 @@ class CleanReplayBuffer:
         replay.validate()
         if len(replay) != int(payload["metadata"]["sample_count"]):
             raise RuntimeError(f"Replay sample-count mismatch: {path}")
+        dist = replay.iteration_distribution()
+        print(f"[REPLAY] Loaded: {len(replay)} samples from {path}, iterations={dict(dist)}", flush=True)
         return replay
 
     def _validate_sample(self, sample: ReplaySample, index: int | None = None) -> None:
