@@ -9,7 +9,7 @@ Manual one-shot export (from a live Kaggle session that still has run state):
 Steps:
   1. resolve Kaggle credentials: environment variables, then
      ~/.kaggle/kaggle.json, then Kaggle notebook secrets (Add-ons -> Secrets)
-  2. pack <run_dir>/checkpoints plus manifest.json and run_state.json into a
+  2. pack <run_dir>/checkpoints plus run_manifest.json and run_state.json into a
      single checkpoints.zip (replay stays out: the run-state dataset owns
      session resume)
   3. upload it as a new version of the target dataset (created if missing)
@@ -83,7 +83,7 @@ def build_zip(run_dir: Path, out: Path) -> int:
 
     count = 0
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
-        for name in ("manifest.json", "run_state.json"):
+        for name in ("run_manifest.json", "run_state.json"):
             path = run_dir / name
             if path.is_file():
                 archive.write(path, name)

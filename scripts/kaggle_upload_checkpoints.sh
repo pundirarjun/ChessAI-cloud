@@ -82,7 +82,7 @@ import zipfile
 
 root, out = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-    for name in ("manifest.json", "run_state.json"):
+    for name in ("run_manifest.json", "run_state.json"):
         path = os.path.join(root, name)
         if os.path.isfile(path):
             zf.write(path, name)

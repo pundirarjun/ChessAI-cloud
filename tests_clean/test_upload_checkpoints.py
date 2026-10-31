@@ -17,7 +17,7 @@ from tools import upload_checkpoints
 def _fake_run(root: Path) -> Path:
     run = root / "run"
     (run / "checkpoints" / "nested").mkdir(parents=True)
-    (run / "manifest.json").write_text("{}", encoding="utf-8")
+    (run / "run_manifest.json").write_text("{}", encoding="utf-8")
     (run / "run_state.json").write_text('{"iteration": 5}', encoding="utf-8")
     (run / "replay").mkdir()
     (run / "replay" / "replay_buffer.pt").write_bytes(b"replay")
@@ -34,7 +34,7 @@ def test_build_zip_includes_checkpoints_and_provenance(tmp_path: Path) -> None:
     with zipfile.ZipFile(out) as archive:
         names = set(archive.namelist())
     assert names == {
-        "manifest.json",
+        "run_manifest.json",
         "run_state.json",
         "checkpoints/iteration_5.pt",
         "checkpoints/best_model.pt",

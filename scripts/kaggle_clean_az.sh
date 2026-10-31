@@ -72,11 +72,8 @@ python tools/benchmark_selfplay.py --engine cpp --sims 100,200,400,800 \
 
 # ---------------------------------------------------------------
 # 6. Iterations.  Each iteration is gated on >=5 GB free space so
-#    the 19 GB working dir never fills mid-write; afterwards the run
-#    state is uploaded to the resume dataset and the checkpoints to
-#    the checkpoints dataset, so stopping the session loses at most
-#    the in-flight iteration.  Run multiple iterations per session
-#    with:  ITERATIONS=5 bash scripts/...
+#    the 19 GB working dir never fills mid-write.  Run multiple
+#    iterations per session with:  ITERATIONS=5 bash scripts/...
 # ---------------------------------------------------------------
 FREE_KB="$(df -k "$PROJECT_ROOT" | awk 'NR==2{print $4}')"
 if [ "$FREE_KB" -lt $((5 * 1024 * 1024)) ]; then
@@ -91,9 +88,20 @@ for it in $(seq 1 "$ITERATIONS"); do
   # Blocked until every preceding validation, including the compiled
   # C++ engine and the performance gate, succeeds.
   python clean_az.py iteration --config "$CONFIG"
-  bash "$PROJECT_ROOT/scripts/kaggle_persist.sh" save "$PROJECT_ROOT" \
-    || echo "[persist] save failed; this iteration lives only in the current session"
-  bash "$PROJECT_ROOT/scripts/kaggle_upload_checkpoints.sh" "$PROJECT_ROOT" "$CONFIG" \
-    || echo "[upload] checkpoint upload failed; this iteration's checkpoints live only in the session"
   echo "[disk] after iteration $it: $(df -h "$PROJECT_ROOT" | awk 'NR==2{print $4}') free | run state: $(du -sh "$RUN_DIR" 2>/dev/null | awk '{print $1}')"
 done
+
+# ---------------------------------------------------------------
+# 7. Persist the whole run directory once, after all iterations
+#    are done.  kaggle_persist.sh zips the entire run dir
+#    (config.json, run_manifest.json, run_state.json, replay/,
+#    checkpoints/, logs/, benchmarks/) and uploads it as a single
+#    run_state.zip.  kaggle_upload_checkpoints.sh uploads a
+#    weights-only archive as a separate dataset for direct
+#    download.  Both are run once, after the loop above.
+# ---------------------------------------------------------------
+bash "$PROJECT_ROOT/scripts/kaggle_persist.sh" save "$PROJECT_ROOT" \
+  || echo "[persist] final save failed; run state lives only in the current session"
+bash "$PROJECT_ROOT/scripts/kaggle_upload_checkpoints.sh" "$PROJECT_ROOT" "$CONFIG" \
+  || echo "[upload] final checkpoint upload failed; checkpoints live only in the session"
+echo "[disk] after all iterations: $(df -h "$PROJECT_ROOT" | awk 'NR==2{print $4}') free | run state: $(du -sh "$RUN_DIR" 2>/dev/null | awk '{print $1}')"

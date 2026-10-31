@@ -107,14 +107,14 @@ restore_run() {
   fi
   mkdir -p "$tmp/run"
   unzip -q -o "$tmp/dl/run_state.zip" -d "$tmp/run"
-  if [ ! -f "$tmp/run/manifest.json" ] || [ ! -f "$tmp/run/run_state.json" ]; then
+  if [ ! -f "$tmp/run/run_manifest.json" ] || [ ! -f "$tmp/run/run_state.json" ]; then
     echo "[persist] dataset '$SLUG' has no recognizable run state; skipping restore"
     return 0
   fi
   # Compare the stored run's config hash with the current config so a
   # config change never resurrects an incompatible run state silently.
   local stored current
-  stored="$(sed -n 's/.*"config_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' "$tmp/run/manifest.json" | head -1)"
+  stored="$(sed -n 's/.*"config_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' "$tmp/run/run_manifest.json" | head -1)"
   current="$(python -c "import hashlib, sys; from az.config import RunConfig; print(hashlib.sha256(RunConfig.load_json(sys.argv[1]).canonical_json().encode('utf-8')).hexdigest())" "$PROJECT_ROOT/configs/clean_az.json")"
   if [ -z "$stored" ] || [ "$stored" != "$current" ]; then
     echo "[persist] dataset state was created with a different config; skipping restore."
