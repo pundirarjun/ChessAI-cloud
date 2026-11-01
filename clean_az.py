@@ -9,6 +9,7 @@ from az.config import RunConfig
 from az.iteration import initialize_clean_run, run_iteration, train_candidate_worker
 from az.preflight import run_preflight
 from az.provenance import load_manifest
+from training.pretrain import run_pretrain
 
 
 def _config(path: str) -> RunConfig:
@@ -18,12 +19,21 @@ def _config(path: str) -> RunConfig:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("init", "preflight", "train-candidate", "iteration", "status"):
+    for command in ("init", "preflight", "train-candidate", "iteration", "status", "pretrain"):
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("--config", required=True, help="Path to clean run JSON config.")
     preflight = subparsers.choices["preflight"]
     preflight.add_argument("--require-two-gpus", action="store_true")
     preflight.add_argument("--require-cpp-engine", action="store_true")
+    pretrain = subparsers.choices["pretrain"]
+    pretrain.add_argument("--pgn-dir", default=None, help="Directory containing PGN files.")
+    pretrain.add_argument("--pgn-glob", default=None, help="Glob pattern for PGN files (recursive).")
+    pretrain.add_argument("--epochs", type=int, default=3)
+    pretrain.add_argument("--lr", type=float, default=1e-3)
+    pretrain.add_argument("--batch-size", type=int, default=256)
+    pretrain.add_argument("--max-games", type=int, default=100000)
+    pretrain.add_argument("--max-positions", type=int, default=2000000)
+    pretrain.add_argument("--num-workers", type=int, default=4)
     args = parser.parse_args()
     config = _config(args.config)
 
@@ -47,6 +57,9 @@ def main() -> None:
         with (config.root / "run_state.json").open("r", encoding="utf-8") as handle:
             state = json.load(handle)
         print(json.dumps({"manifest": manifest.to_dict(), "state": state}, indent=2, sort_keys=True))
+        return
+    if args.command == "pretrain":
+        run_pretrain(config, args)
         return
 
     # Training is deliberately guarded: the requested system must not start a

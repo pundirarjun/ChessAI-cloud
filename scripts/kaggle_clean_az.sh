@@ -53,6 +53,37 @@ if [ -f "$RUN_MANIFEST" ]; then
 else
   python clean_az.py init --config "$CONFIG"
 fi
+
+# ---------------------------------------------------------------
+# 3b. Supervised pretraining (optional).  If PRETRAIN_PGN_GLOB is
+#     set and no iteration has completed yet, pretrain the network
+#     on human games before self-play.  The guard (iteration == 0)
+#     ensures this runs only once across sessions.
+# ---------------------------------------------------------------
+RUN_DIR="$(python -c "import sys; from az.config import RunConfig; print(RunConfig.load_json(sys.argv[1]).root.as_posix())" "$CONFIG")"
+if [ -n "${PRETRAIN_PGN_GLOB:-}" ]; then
+  RUN_STATE="$RUN_DIR/run_state.json"
+  if [ -f "$RUN_STATE" ]; then
+    CUR_ITER="$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['iteration'])" "$RUN_STATE")"
+  else
+    CUR_ITER=0
+  fi
+  if [ "$CUR_ITER" -gt 0 ]; then
+    echo "[pretrain] skipping: iteration $CUR_ITER already completed"
+  else
+    echo "[pretrain] running supervised pretraining (glob: $PRETRAIN_PGN_GLOB)"
+    python clean_az.py pretrain --config "$CONFIG" \
+      --pgn-glob "$PRETRAIN_PGN_GLOB" \
+      --epochs "${PRETRAIN_EPOCHS:-3}" \
+      --lr "${PRETRAIN_LR:-0.001}" \
+      --batch-size "${PRETRAIN_BATCH_SIZE:-256}" \
+      --max-games "${PRETRAIN_MAX_GAMES:-100000}" \
+      --max-positions "${PRETRAIN_MAX_POSITIONS:-2000000}"
+  fi
+else
+  echo "[pretrain] skipped (PRETRAIN_PGN_GLOB not set)"
+fi
+
 python clean_az.py preflight --config "$CONFIG" --require-two-gpus --require-cpp-engine
 
 # ---------------------------------------------------------------
@@ -81,7 +112,6 @@ if [ "$FREE_KB" -lt $((5 * 1024 * 1024)) ]; then
   exit 1
 fi
 echo "[disk] before iterations: $((FREE_KB / 1024 / 1024)) GB free"
-RUN_DIR="$(python -c "import sys; from az.config import RunConfig; print(RunConfig.load_json(sys.argv[1]).root.as_posix())" "$CONFIG")"
 ITERATIONS="${ITERATIONS:-1}"
 for it in $(seq 1 "$ITERATIONS"); do
   echo "=== iteration step $it/$ITERATIONS ==="
